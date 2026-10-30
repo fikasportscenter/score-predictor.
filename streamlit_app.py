@@ -214,7 +214,7 @@ def predictor_ui(has_access, key):
 # ---------- paywall screens ----------
 def picks_tab(has_access, key):
     with st.spinner("Loading today's picks (first time can take ~30 seconds)..."):
-        res, err = get_picks(3)
+        res, err = get_picks(1)
     if err:
         st.error(err)
         return
