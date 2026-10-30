@@ -11,12 +11,14 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
 import contextlib
 import hashlib
 import hmac
+import html
 import io
 import time
 from urllib.parse import quote
 
 import streamlit as st
 
+import picks as pk
 import predictor_nokey as p
 
 st.set_page_config(page_title="Score Predictor", page_icon="⚽")
@@ -27,6 +29,13 @@ st.markdown("""
 .teams {text-align:center; font-size:1.1rem; opacity:0.85;}
 .sub {text-align:center; opacity:0.7; margin-bottom:0.8rem;}
 .form {font-size:1.3rem; letter-spacing:2px;}
+.pick {border:1px solid rgba(128,128,128,.35); border-radius:14px; padding:10px 14px; margin:0 0 10px 0;}
+.pick .meta {opacity:.65; font-size:.82rem;}
+.pick .vs {font-weight:700; font-size:1.05rem; margin:2px 0 8px 0;}
+.pill {display:inline-block; border-radius:999px; padding:4px 11px; margin:0 6px 6px 0; font-size:.88rem; font-weight:600; background:#dce9ff; color:#164a9a;}
+.pill.hot {background:#d6f5df; color:#14532d;}
+.pill.lock {background:#e5e7eb; color:#555;}
+.day {margin:18px 0 6px 0; font-weight:700; opacity:.65; text-transform:uppercase; font-size:.8rem; letter-spacing:.06em;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -74,11 +83,33 @@ def time_left_text(seconds):
 
 
 # ---------- prediction ----------
+@st.cache_resource(ttl=6 * 3600, show_spinner=False)
+def league_data():
+    """All leagues downloaded once and shared by every visitor (6 hours)."""
+    cache = {}
+    p.load_all(cache)
+    if not any(cache.values()):
+        # Raising means Streamlit does NOT cache this failure.
+        raise RuntimeError("Could not download match data right now. Please try again.")
+    return cache
+
+
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def get_picks(days):
+    """Returns (result, error). Cached for 3 hours."""
+    try:
+        return pk.compute_picks(league_data(), days), None
+    except RuntimeError as e:
+        return None, str(e)
+    except Exception as e:
+        return None, f"Something went wrong: {e}"
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def compute(home_q, away_q):
     """Returns (data, error). Cached for 6 hours per team pair."""
-    cache = {}
     try:
+        cache = league_data()
         with contextlib.redirect_stdout(io.StringIO()):
             hn, hrows = p.locate(home_q, cache)
             an, arows = p.locate(away_q, cache)
@@ -90,7 +121,7 @@ def compute(home_q, away_q):
         hs, as_ = p.summarise(hm, ratings, True), p.summarise(am, ratings, False)
         return {"home": hn, "away": an, "hm": hm, "am": am,
                 "hs": hs, "as": as_, "pred": p.predict(hs, as_, avg)}, None
-    except SystemExit as e:
+    except (SystemExit, RuntimeError) as e:
         return None, str(e)
     except Exception as e:
         return None, f"Something went wrong: {e}"
@@ -153,11 +184,10 @@ def show_locked(data, key):
     st.markdown("<div class='big-score'>? - ?</div>", unsafe_allow_html=True)
     st.markdown("<div class='sub'>🔒 Prediction locked. Pay to unlock it.</div>",
                 unsafe_allow_html=True)
-    payment_box(key)
+    payment_box(key, "predict")
 
 
 def predictor_ui(has_access, key):
-    st.title("⚽ Score Predictor")
     st.caption("Based on each team's last 6 matches. Try: Arsenal, Man United, "
                "Man City, Ath Madrid, Inter, Bayern (partial names work).")
     home = st.text_input("Home team", placeholder="Arsenal")
@@ -182,7 +212,44 @@ def predictor_ui(has_access, key):
 
 
 # ---------- paywall screens ----------
-def payment_box(key):
+def picks_tab(has_access, key):
+    with st.spinner("Loading today's picks (first time can take ~30 seconds)..."):
+        res, err = get_picks(3)
+    if err:
+        st.error(err)
+        return
+    ms = res["matches"]
+    st.caption(f"Next {res['days']} days · {len(ms)} high-confidence pick"
+               f"{'' if len(ms) == 1 else 's'} from {res['analysed']} matches analysed. "
+               "Times are UK time.")
+    if not has_access:
+        st.markdown(f"**🔒 {len(ms)} pick{'' if len(ms) == 1 else 's'} found. "
+                    "Unlock to see which bets and the percentages.**")
+        payment_box(key, "picks")
+    if not ms:
+        st.info("No high-confidence picks in the next few days. Check again later.")
+        return
+    day = None
+    for m in ms:
+        if m["date"] != day:
+            day = m["date"]
+            st.markdown(f"<div class='day'>{day.strftime('%A, %d %B')}</div>",
+                        unsafe_allow_html=True)
+        if has_access:
+            pills = "".join(
+                f"<span class='pill{' hot' if pr >= 0.75 else ''}'>{html.escape(mk)} · {pr:.0%}</span>"
+                for mk, pr in m["picks"])
+        else:
+            n = len(m["picks"])
+            pills = f"<span class='pill lock'>🔒 {n} pick{'' if n == 1 else 's'} locked</span>"
+        st.markdown(
+            f"<div class='pick'><div class='meta'>{html.escape(m['league'])} · "
+            f"{html.escape(m['time'])}</div><div class='vs'>{html.escape(m['home'])} vs "
+            f"{html.escape(m['away'])}</div>{pills}</div>", unsafe_allow_html=True)
+    st.caption("Model estimates from recent form. Not guarantees and not betting advice.")
+
+
+def payment_box(key, where):
     price = secret("PRICE_TEXT", "Ask the owner for the price")
     how = secret("PAY_INSTRUCTIONS", "Contact the owner to pay.")
     st.markdown(f"**Price:** {price}")
@@ -194,8 +261,9 @@ def payment_box(key):
                     f"(https://wa.me/{wa}?text={msg}) and we'll send your access code.")
     else:
         st.markdown("After paying, send the payment message to the owner to get your code.")
-    code = st.text_input("Have a code? Enter it here", placeholder="FB-XXXXXXXX-XXXXXXXXXX")
-    if st.button("Unlock", use_container_width=True):
+    code = st.text_input("Have a code? Enter it here", placeholder="FB-XXXXXXXX-XXXXXXXXXX",
+                         key=f"code_{where}")
+    if st.button("Unlock", use_container_width=True, key=f"unlock_{where}"):
         ok, info = check_code(key, code)
         if ok:
             st.session_state["code"] = code.strip()
@@ -248,5 +316,10 @@ if not has_access:
         st.warning(info)
         st.session_state.pop("code", None)
 
-predictor_ui(has_access, key)
+st.title("⚽ Score Predictor")
+tab_picks, tab_pred = st.tabs(["🔥 Top picks", "🔍 Predict a match"])
+with tab_picks:
+    picks_tab(has_access, key)
+with tab_pred:
+    predictor_ui(has_access, key)
 owner_panel(key, admin_pw)
