@@ -10,6 +10,8 @@ Usage:
   python predictor_nokey.py "Real Madrid" "Barcelona"
   python predictor_nokey.py --demo          (offline test)
 
+Covers England (top 5 tiers), Spain, Italy, Germany, France (top 2 tiers each),
+Netherlands, Portugal, Belgium, Turkey, Greece and Scotland (4 tiers).
 Team names use the site's spelling, e.g. "Man United", "Man City", "Ath Madrid",
 "Inter", "Bayern Munich". Partial names work ("Man U", "Bayern").
 """
@@ -19,14 +21,20 @@ import io
 import math
 import sys
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 BASE = "https://www.football-data.co.uk/mmz4281/{season}/{code}.csv"
 SEASONS = ["2627", "2526"]   # current season first, then previous (to fill early-season gaps)
 LEAGUES = {                  # code -> name
-    "E0": "Premier League", "E1": "Championship", "SP1": "La Liga",
-    "I1": "Serie A", "D1": "Bundesliga", "F1": "Ligue 1",
-    "N1": "Eredivisie", "P1": "Primeira Liga", "SC0": "Scottish Premiership",
+    "E0": "Premier League", "E1": "Championship", "E2": "League One",
+    "E3": "League Two", "EC": "National League",
+    "SP1": "La Liga", "SP2": "La Liga 2", "I1": "Serie A", "I2": "Serie B",
+    "D1": "Bundesliga", "D2": "Bundesliga 2", "F1": "Ligue 1", "F2": "Ligue 2",
+    "N1": "Eredivisie", "P1": "Primeira Liga", "B1": "Belgian Pro League",
+    "T1": "Turkish Super Lig", "G1": "Greek Super League",
+    "SC0": "Scottish Premiership", "SC1": "Scottish Championship",
+    "SC2": "Scottish League One", "SC3": "Scottish League Two",
 }
 DEFAULT_AVG_GOALS = 1.35
 HOME_ADVANTAGE = 1.05
@@ -82,18 +90,26 @@ def find_team_names(query, rows):
     return exact or [n for n in names if q in n.lower()]
 
 
+def load_all(league_cache):
+    """Download every league in parallel (much faster than one by one)."""
+    todo = [c for c in LEAGUES if c not in league_cache]
+    if todo:
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            for code, rows in zip(todo, ex.map(load_league, todo)):
+                league_cache[code] = rows
+
+
 def locate(query, league_cache):
     """Search all leagues for the team. Returns (team_name, rows)."""
+    load_all(league_cache)
     for code in LEAGUES:
-        if code not in league_cache:
-            league_cache[code] = load_league(code)
         hits = find_team_names(query, league_cache[code])
         if hits:
             if len(hits) > 1:
                 print(f"'{query}' matches {hits}; using '{hits[0]}'.")
             return hits[0], league_cache[code]
     sys.exit(f"Team '{query}' not found. Try the site's spelling "
-             f"(e.g. 'Man United', 'Ath Madrid').")
+             f"(e.g. 'Man United', 'Ath Madrid', 'Leyton Orient').")
 
 
 def last_matches(team, rows, n=N):
