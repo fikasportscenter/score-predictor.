@@ -12,7 +12,7 @@ import predictor_nokey as p
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 
 # A match is a "top pick" when the model gives at least this chance.
-PICK_MIN = {"win": 0.70, "over15": 0.85, "over25": 0.72, "btts_yes": 0.70, "btts_no": 0.72}
+PICK_MIN = {"win": 0.65, "over15": 0.82, "over25": 0.66, "btts_yes": 0.65, "btts_no": 0.67}
 
 
 def load_fixtures():
