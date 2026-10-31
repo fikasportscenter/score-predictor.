@@ -1,8 +1,10 @@
 """Top picks: finds upcoming fixtures where the model gives a high chance of a
-home/away win, over 2.5 goals, or both-teams-score yes/no.
+home/away win, over 1.5 or 2.5 goals, or both-teams-score yes/no.
+Also back-tests recent days so visitors can see how past picks did.
 Needs predictor_nokey.py beside it."""
 import csv
 import io
+import math
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -11,7 +13,7 @@ import predictor_nokey as p
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 
 # A match is a "top pick" when the model gives at least this chance.
-PICK_MIN = {"win": 0.60, "over25": 0.62, "btts_yes": 0.60, "btts_no": 0.62}
+PICK_MIN = {"win": 0.65, "over15": 0.82, "over25": 0.66, "btts_yes": 0.65, "btts_no": 0.67}
 
 
 def load_fixtures():
@@ -39,6 +41,11 @@ def picks_for(pr):
         picks.append(("Home win", pr["home"]))
     if pr["away"] >= PICK_MIN["win"]:
         picks.append(("Away win", pr["away"]))
+    # Chance of 2+ total goals, from the two expected-goal values (total goals is Poisson).
+    total = pr["xg_home"] + pr["xg_away"]
+    over15 = 1 - math.exp(-total) * (1 + total)
+    if over15 >= PICK_MIN["over15"]:
+        picks.append(("Over 1.5 goals", over15))
     if pr["over25"] >= PICK_MIN["over25"]:
         picks.append(("Over 2.5 goals", pr["over25"]))
     if pr["btts"] >= PICK_MIN["btts_yes"]:
@@ -93,3 +100,55 @@ def compute_picks(league_cache, days=3, today=None):
                             "home": home, "away": away, "picks": picks})
     matches.sort(key=lambda m: (m["date"], -m["picks"][0][1]))
     return {"matches": matches, "analysed": analysed, "days": days}
+
+
+# ---------- recent results (back-test) ----------
+def _hit(market, hg, ag):
+    return {
+        "Home win": hg > ag,
+        "Away win": ag > hg,
+        "Over 1.5 goals": hg + ag >= 2,
+        "Over 2.5 goals": hg + ag >= 3,
+        "Both teams score: Yes": hg > 0 and ag > 0,
+        "Both teams score: No": hg == 0 or ag == 0,
+    }[market]
+
+
+def compute_results(league_cache, days_back=7, today=None):
+    """Re-runs the pick rules on matches already played, for each of the last
+    `days_back` days, using ONLY results from before that day. Marks every pick
+    hit or miss. All picks are included (no cherry-picking)."""
+    today = today or datetime.now(timezone.utc).date()
+    days, total, hits = [], 0, 0
+    for k in range(1, days_back + 1):
+        day = today - timedelta(days=k)
+        day_matches, day_total, day_hits = [], 0, 0
+        for div, rows in league_cache.items():
+            played = [r for r in rows if r["date"].date() == day]
+            if not played:
+                continue
+            pool = [r for r in rows if r["date"].date() < day]
+            if len(pool) < 30:
+                continue
+            ratings, avg = p.ratings_from(pool)
+            for m in played:
+                hm, am = p.last_matches(m["home"], pool), p.last_matches(m["away"], pool)
+                if len(hm) < 3 or len(am) < 3:
+                    continue
+                pr = p.predict(p.summarise(hm, ratings, True),
+                               p.summarise(am, ratings, False), avg)
+                marked = []
+                for market, prob in picks_for(pr):
+                    ok = _hit(market, m["hg"], m["ag"])
+                    marked.append({"market": market, "prob": prob, "hit": ok})
+                    day_total += 1
+                    day_hits += ok
+                if marked:
+                    day_matches.append({"league": p.LEAGUES.get(div, div),
+                                        "home": m["home"], "away": m["away"],
+                                        "score": f"{m['hg']}-{m['ag']}", "picks": marked})
+        day_matches.sort(key=lambda x: -x["picks"][0]["prob"])
+        days.append({"date": day, "matches": day_matches, "total": day_total, "hits": day_hits})
+        total += day_total
+        hits += day_hits
+    return {"days": days, "total": total, "hits": hits, "days_back": days_back}
