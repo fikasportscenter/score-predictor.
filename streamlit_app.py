@@ -222,30 +222,6 @@ def predictor_ui(has_access, key):
 
 
 # ---------- top picks ----------
-def accumulator_section(res, has_access):
-    """Accumulator box. Selections are hidden from visitors who have not paid."""
-    acc = res.get("acc")
-    st.markdown("### 🎯 Accumulator (odds about 5)")
-    if not acc:
-        st.info("Not enough suitable picks today to build an accumulator.")
-        return
-    if not has_access:
-        st.caption(f"🔒 {len(acc['legs'])} matches combined, total odds {acc['odds']:.1f}. "
-                   "Unlock to see the selections.")
-        return
-    for l in acc["legs"]:
-        st.markdown(
-            f"<div class='pick'><div class='meta'>{html.escape(l['league'])}</div>"
-            f"<div class='vs'>{html.escape(l['home'])} vs {html.escape(l['away'])}</div>"
-            f"<span class='pill'>{html.escape(l['market'])} · {l['prob']:.0%} · "
-            f"odds {1 / l['prob']:.2f}</span></div>", unsafe_allow_html=True)
-    st.markdown(f"**Total odds {acc['odds']:.2f} · model chance of all {len(acc['legs'])} "
-                f"winning: {acc['chance']:.0%}**")
-    st.caption("Odds here are the model's own fair odds, not bookmaker prices. An "
-               "accumulator loses if even one leg loses, so it wins far less often than "
-               "single picks.")
-
-
 def picks_tab(has_access, key):
     with st.spinner("Loading today's picks (first time can take ~30 seconds)..."):
         res, err = get_picks(1)
@@ -260,7 +236,6 @@ def picks_tab(has_access, key):
         st.markdown(f"**🔒 {len(ms)} pick{'' if len(ms) == 1 else 's'} found. "
                     "Unlock to see which bets, the percentages and the full analysis.**")
         payment_box(key, "picks")
-    accumulator_section(res, has_access)
     if not ms:
         st.info("No high-confidence picks today. Check again later.")
     else:
