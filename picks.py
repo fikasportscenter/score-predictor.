@@ -1,6 +1,7 @@
 """Top picks: finds upcoming fixtures where the model gives a high chance of a
 home/away win, over 1.5 or 2.5 goals, or both-teams-score yes/no.
-Also back-tests recent days so visitors can see how past picks did.
+Also builds best picks and an accumulator, and back-tests recent days so
+visitors can see how past picks did.
 Needs predictor_nokey.py beside it."""
 import csv
 import io
@@ -14,6 +15,12 @@ FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 
 # A match is a "top pick" when the model gives at least this chance.
 PICK_MIN = {"win": 0.65, "over15": 0.82, "over25": 0.66, "btts_yes": 0.65, "btts_no": 0.67}
+
+# Accumulator: combine one pick per match until the model odds reach the target.
+ACC_TARGET = 5.0      # total odds wanted
+ACC_MAX_PROB = 0.85   # skip legs so likely that their odds are tiny (e.g. 1.05)
+ACC_MAX_LEGS = 8
+BEST_COUNT = 5        # how many "best picks" to feature
 
 
 def load_fixtures():
@@ -55,8 +62,45 @@ def picks_for(pr):
     return sorted(picks, key=lambda x: -x[1])
 
 
+def build_accumulator(cands, target=ACC_TARGET):
+    """cands: list of dicts with 'prob' (one best pick per match). Takes the most
+    likely legs first and finishes with the likeliest leg that reaches the target.
+    Odds are model odds (1 / probability), not bookmaker odds. Returns None if the
+    target cannot be reached."""
+    pool = sorted((c for c in cands if c["prob"] <= ACC_MAX_PROB), key=lambda c: -c["prob"])
+    legs, odds = [], 1.0
+    while pool and len(legs) < ACC_MAX_LEGS:
+        finisher = next((c for c in pool if odds / c["prob"] >= target), None)
+        if finisher:
+            legs.append(finisher)
+            odds /= finisher["prob"]
+            break
+        c = pool.pop(0)
+        legs.append(c)
+        odds /= c["prob"]
+    if odds < target:
+        return None
+    chance = 1.0
+    for c in legs:
+        chance *= c["prob"]
+    return {"legs": legs, "odds": odds, "chance": chance}
+
+
+def _acc_candidates(entries):
+    """entries: list of (match_dict, [(market, prob, extra), ...] sorted best first).
+    One candidate per match: its best pick under ACC_MAX_PROB."""
+    out = []
+    for m, picks in entries:
+        for market, prob, extra in picks:
+            if prob <= ACC_MAX_PROB:
+                out.append({"league": m["league"], "home": m["home"], "away": m["away"],
+                            "market": market, "prob": prob, **extra})
+                break
+    return out
+
+
 def compute_picks(league_cache, days=3, today=None):
-    """Returns {'matches': [...], 'analysed': n, 'days': days}.
+    """Returns {'matches': [...], 'analysed': n, 'days': days, 'best': [...], 'acc': {...}}.
     league_cache is the dict filled by predictor_nokey.load_all()."""
     fixtures = load_fixtures()
     today = today or datetime.now(timezone.utc).date()
@@ -99,7 +143,12 @@ def compute_picks(league_cache, days=3, today=None):
                             "league": p.LEAGUES.get(f["div"], f["div"]),
                             "home": home, "away": away, "picks": picks})
     matches.sort(key=lambda m: (m["date"], -m["picks"][0][1]))
-    return {"matches": matches, "analysed": analysed, "days": days}
+    best = sorted(matches, key=lambda m: -m["picks"][0][1])[:BEST_COUNT]
+    best = [{"league": m["league"], "time": m["time"], "home": m["home"], "away": m["away"],
+             "market": m["picks"][0][0], "prob": m["picks"][0][1]} for m in best]
+    acc = build_accumulator(_acc_candidates(
+        [(m, [(mk, pr, {}) for mk, pr in m["picks"]]) for m in matches]))
+    return {"matches": matches, "analysed": analysed, "days": days, "best": best, "acc": acc}
 
 
 # ---------- recent results (back-test) ----------
@@ -148,7 +197,15 @@ def compute_results(league_cache, days_back=7, today=None):
                                         "home": m["home"], "away": m["away"],
                                         "score": f"{m['hg']}-{m['ag']}", "picks": marked})
         day_matches.sort(key=lambda x: -x["picks"][0]["prob"])
-        days.append({"date": day, "matches": day_matches, "total": day_total, "hits": day_hits})
+        acc = build_accumulator(_acc_candidates(
+            [(m, [(x["market"], x["prob"], {"hit": x["hit"]}) for x in m["picks"]])
+             for m in day_matches]))
+        if acc:
+            acc["won"] = all(l["hit"] for l in acc["legs"])
+        days.append({"date": day, "matches": day_matches, "total": day_total,
+                     "hits": day_hits, "acc": acc})
         total += day_total
         hits += day_hits
-    return {"days": days, "total": total, "hits": hits, "days_back": days_back}
+    acc_days = [d["acc"] for d in days if d["acc"]]
+    return {"days": days, "total": total, "hits": hits, "days_back": days_back,
+            "acc_total": len(acc_days), "acc_won": sum(a["won"] for a in acc_days)}
