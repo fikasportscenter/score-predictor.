@@ -35,6 +35,7 @@ st.markdown("""
 .pill {display:inline-block; border-radius:999px; padding:4px 11px; margin:0 6px 6px 0; font-size:.88rem; font-weight:600; background:#dce9ff; color:#164a9a;}
 .pill.hot {background:#d6f5df; color:#14532d;}
 .pill.lock {background:#e5e7eb; color:#555;}
+.pill.miss {background:#fde2e2; color:#7f1d1d;}
 .day {margin:18px 0 6px 0; font-weight:700; opacity:.65; text-transform:uppercase; font-size:.8rem; letter-spacing:.06em;}
 </style>
 """, unsafe_allow_html=True)
@@ -101,6 +102,15 @@ def get_picks(days):
         return pk.compute_picks(league_data(), days), None
     except RuntimeError as e:
         return None, str(e)
+    except Exception as e:
+        return None, f"Something went wrong: {e}"
+
+
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def get_results():
+    """Returns (result, error). Back-test of the last 7 days. Cached for 3 hours."""
+    try:
+        return pk.compute_results(league_data(), 7), None
     except Exception as e:
         return None, f"Something went wrong: {e}"
 
@@ -289,6 +299,37 @@ def picks_tab(has_access, key):
     st.caption("Model estimates from recent form. Not guarantees and not betting advice.")
 
 
+# ---------- results of past days ----------
+def results_tab():
+    """Past results. Visible to everyone: old picks have no betting value."""
+    with st.spinner("Loading results (first time can take ~30 seconds)..."):
+        res, err = get_results()
+    if err:
+        st.error(f"Results could not load: {err}")
+        return
+    days = [d for d in res["days"] if d["total"]]
+    if not days:
+        st.info("No finished picks to show yet. Check again later.")
+        return
+    st.caption("Tap a date to see every pick for that day, marked ✅ hit or ❌ miss. "
+               "Back-tested: the same model and rules re-run on the data that was "
+               "available before each match. Wins and losses are all shown.")
+    labels = {d["date"].strftime("%a %d %b"): d for d in days}
+    choice = st.radio("Choose a date", list(labels), horizontal=True)
+    d = labels[choice]
+    st.markdown(f"**{d['hits']} of {d['total']} picks hit ({d['hits'] / d['total']:.0%})**")
+    for m in d["matches"]:
+        pills = "".join(
+            f"<span class='pill {'hot' if x['hit'] else 'miss'}'>"
+            f"{'✅' if x['hit'] else '❌'} {html.escape(x['market'])} · {x['prob']:.0%}</span>"
+            for x in m["picks"])
+        st.markdown(
+            f"<div class='pick'><div class='meta'>{html.escape(m['league'])} · "
+            f"Final score {html.escape(m['score'])}</div><div class='vs'>"
+            f"{html.escape(m['home'])} vs {html.escape(m['away'])}</div>{pills}</div>",
+            unsafe_allow_html=True)
+
+
 def payment_box(key, where):
     price = secret("PRICE_TEXT", "Ask the owner for the price")
     how = secret("PAY_INSTRUCTIONS", "Contact the owner to pay.")
@@ -357,9 +398,11 @@ if not has_access:
         st.session_state.pop("code", None)
 
 st.title("⚽ Score Predictor")
-tab_picks, tab_pred = st.tabs(["🔥 Top picks", "🔍 Predict a match"])
+tab_picks, tab_results, tab_pred = st.tabs(["🔥 Top picks", "📊 Results", "🔍 Predict a match"])
 with tab_picks:
     picks_tab(has_access, key)
+with tab_results:
+    results_tab()
 with tab_pred:
     predictor_ui(has_access, key)
 owner_panel(key, admin_pw)
