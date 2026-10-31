@@ -234,7 +234,7 @@ def picks_tab(has_access, key):
                "Times are UK time.")
     if not has_access:
         st.markdown(f"**🔒 {len(ms)} pick{'' if len(ms) == 1 else 's'} found. "
-                    "Unlock to see which bets and the percentages.**")
+                    "Unlock to see which bets, the percentages and the full analysis.**")
         payment_box(key, "picks")
     if not ms:
         st.info("No high-confidence picks today. Check again later.")
@@ -255,6 +255,20 @@ def picks_tab(has_access, key):
             f"<div class='pick'><div class='meta'>{html.escape(m['league'])} · "
             f"{html.escape(m['time'])}</div><div class='vs'>{html.escape(m['home'])} vs "
             f"{html.escape(m['away'])}</div>{pills}</div>", unsafe_allow_html=True)
+        if has_access:
+            pid = f"{m['home']}|{m['away']}"
+            opened = st.session_state.get("open_pick") == pid
+            if st.button("✖ Close analysis" if opened else "📈 See analysis",
+                         key=f"an_{pid}", use_container_width=True):
+                st.session_state["open_pick"] = None if opened else pid
+                st.rerun()
+            if opened:
+                with st.spinner("Loading analysis..."):
+                    data, aerr = compute(m["home"], m["away"])
+                if aerr:
+                    st.error(aerr)
+                else:
+                    show_result(data)
     st.caption("Model estimates from recent form. Not guarantees and not betting advice.")
     results_section()
 
@@ -262,7 +276,10 @@ def picks_tab(has_access, key):
 def results_section():
     """Recent results, visible to everyone (past picks have no betting value)."""
     res, err = get_results()
-    if err or not res:
+    if err:
+        st.error(f"Recent results could not load: {err}")
+        return
+    if not res:
         return
     st.markdown("### 📊 Recent results")
     st.caption("Back-tested: the same model and pick rules re-run on the data that was "
