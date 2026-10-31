@@ -1,5 +1,5 @@
 """Football score predictor - paid access (access codes). Phone-friendly Streamlit app.
-Needs predictor_nokey.py beside it.
+Needs predictor_nokey.py and picks.py beside it.
 
 Secrets to set in Streamlit (Manage app > Settings > Secrets):
   CODE_SECRET      = "long random text, keep private"
@@ -35,6 +35,7 @@ st.markdown("""
 .pill {display:inline-block; border-radius:999px; padding:4px 11px; margin:0 6px 6px 0; font-size:.88rem; font-weight:600; background:#dce9ff; color:#164a9a;}
 .pill.hot {background:#d6f5df; color:#14532d;}
 .pill.lock {background:#e5e7eb; color:#555;}
+.pill.miss {background:#fde2e2; color:#7f1d1d;}
 .day {margin:18px 0 6px 0; font-weight:700; opacity:.65; text-transform:uppercase; font-size:.8rem; letter-spacing:.06em;}
 </style>
 """, unsafe_allow_html=True)
@@ -101,6 +102,15 @@ def get_picks(days):
         return pk.compute_picks(league_data(), days), None
     except RuntimeError as e:
         return None, str(e)
+    except Exception as e:
+        return None, f"Something went wrong: {e}"
+
+
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def get_results():
+    """Returns (result, error). Back-test of the last 7 days. Cached for 3 hours."""
+    try:
+        return pk.compute_results(league_data(), 7), None
     except Exception as e:
         return None, f"Something went wrong: {e}"
 
@@ -211,7 +221,7 @@ def predictor_ui(has_access, key):
         show_locked(data, key)
 
 
-# ---------- paywall screens ----------
+# ---------- top picks + recent results ----------
 def picks_tab(has_access, key):
     with st.spinner("Loading today's picks (first time can take ~30 seconds)..."):
         res, err = get_picks(1)
@@ -219,7 +229,7 @@ def picks_tab(has_access, key):
         st.error(err)
         return
     ms = res["matches"]
-    st.caption(f"Next {res['days']} days · {len(ms)} high-confidence pick"
+    st.caption(f"Today · {len(ms)} high-confidence pick"
                f"{'' if len(ms) == 1 else 's'} from {res['analysed']} matches analysed. "
                "Times are UK time.")
     if not has_access:
@@ -227,8 +237,7 @@ def picks_tab(has_access, key):
                     "Unlock to see which bets and the percentages.**")
         payment_box(key, "picks")
     if not ms:
-        st.info("No high-confidence picks in the next few days. Check again later.")
-        return
+        st.info("No high-confidence picks today. Check again later.")
     day = None
     for m in ms:
         if m["date"] != day:
@@ -247,6 +256,40 @@ def picks_tab(has_access, key):
             f"{html.escape(m['time'])}</div><div class='vs'>{html.escape(m['home'])} vs "
             f"{html.escape(m['away'])}</div>{pills}</div>", unsafe_allow_html=True)
     st.caption("Model estimates from recent form. Not guarantees and not betting advice.")
+    results_section()
+
+
+def results_section():
+    """Recent results, visible to everyone (past picks have no betting value)."""
+    res, err = get_results()
+    if err or not res:
+        return
+    st.markdown("### 📊 Recent results")
+    st.caption("Back-tested: the same model and pick rules re-run on the data that was "
+               "available before each match. Every pick is shown, wins and losses.")
+    if not res["total"]:
+        st.info("No finished picks to show yet.")
+        return
+    rate = res["hits"] / res["total"]
+    st.markdown(f"**Last {res['days_back']} days: {res['hits']} of {res['total']} picks "
+                f"hit ({rate:.0%})**")
+    days = [d for d in res["days"] if d["total"]]
+    for d in days:
+        st.caption(f"{d['date'].strftime('%a %d %b')}: {d['hits']} of {d['total']} hit "
+                   f"({d['hits'] / d['total']:.0%})")
+    latest = days[0]
+    st.markdown(f"<div class='day'>{latest['date'].strftime('%A, %d %B')}</div>",
+                unsafe_allow_html=True)
+    for m in latest["matches"]:
+        pills = "".join(
+            f"<span class='pill {'hot' if x['hit'] else 'miss'}'>"
+            f"{'✅' if x['hit'] else '❌'} {html.escape(x['market'])} · {x['prob']:.0%}</span>"
+            for x in m["picks"])
+        st.markdown(
+            f"<div class='pick'><div class='meta'>{html.escape(m['league'])} · "
+            f"Final score {html.escape(m['score'])}</div><div class='vs'>"
+            f"{html.escape(m['home'])} vs {html.escape(m['away'])}</div>{pills}</div>",
+            unsafe_allow_html=True)
 
 
 def payment_box(key, where):
