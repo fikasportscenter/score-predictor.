@@ -222,6 +222,42 @@ def predictor_ui(has_access, key):
 
 
 # ---------- top picks + recent results ----------
+def featured(res, has_access):
+    """Best picks + accumulator. Locked (names hidden) for visitors."""
+    best, acc = res.get("best") or [], res.get("acc")
+    if best:
+        st.markdown("### ⭐ Best picks")
+        if has_access:
+            for b in best:
+                st.markdown(
+                    f"<div class='pick'><div class='meta'>{html.escape(b['league'])} · "
+                    f"{html.escape(b['time'])}</div><div class='vs'>{html.escape(b['home'])} vs "
+                    f"{html.escape(b['away'])}</div><span class='pill hot'>"
+                    f"{html.escape(b['market'])} · {b['prob']:.0%}</span></div>",
+                    unsafe_allow_html=True)
+        else:
+            st.caption(f"🔒 The {len(best)} strongest picks of the day. Unlock to see them.")
+    st.markdown("### 🎯 Accumulator (odds about 5)")
+    if not acc:
+        st.info("Not enough suitable picks today to build an accumulator.")
+        return
+    if not has_access:
+        st.caption(f"🔒 {len(acc['legs'])} matches combined, total odds {acc['odds']:.1f}. "
+                   "Unlock to see the selections.")
+        return
+    for l in acc["legs"]:
+        st.markdown(
+            f"<div class='pick'><div class='meta'>{html.escape(l['league'])}</div>"
+            f"<div class='vs'>{html.escape(l['home'])} vs {html.escape(l['away'])}</div>"
+            f"<span class='pill'>{html.escape(l['market'])} · {l['prob']:.0%} · "
+            f"odds {1 / l['prob']:.2f}</span></div>", unsafe_allow_html=True)
+    st.markdown(f"**Total odds {acc['odds']:.2f} · model chance of all {len(acc['legs'])} "
+                f"winning: {acc['chance']:.0%}**")
+    st.caption("Odds here are the model's own fair odds, not bookmaker prices. An "
+               "accumulator loses if even one leg loses, so it wins far less often than "
+               "single picks.")
+
+
 def picks_tab(has_access, key):
     with st.spinner("Loading today's picks (first time can take ~30 seconds)..."):
         res, err = get_picks(1)
@@ -236,8 +272,11 @@ def picks_tab(has_access, key):
         st.markdown(f"**🔒 {len(ms)} pick{'' if len(ms) == 1 else 's'} found. "
                     "Unlock to see which bets, the percentages and the full analysis.**")
         payment_box(key, "picks")
+    featured(res, has_access)
     if not ms:
         st.info("No high-confidence picks today. Check again later.")
+    else:
+        st.markdown("### 📋 All today's picks")
     day = None
     for m in ms:
         if m["date"] != day:
@@ -290,10 +329,15 @@ def results_section():
     rate = res["hits"] / res["total"]
     st.markdown(f"**Last {res['days_back']} days: {res['hits']} of {res['total']} picks "
                 f"hit ({rate:.0%})**")
+    if res.get("acc_total"):
+        st.markdown(f"**🎯 Accumulator (odds about 5): won {res['acc_won']} of "
+                    f"{res['acc_total']} days**")
     days = [d for d in res["days"] if d["total"]]
     for d in days:
+        acc = d.get("acc")
+        flag = f" · 🎯 {'✅' if acc['won'] else '❌'} acc" if acc else ""
         st.caption(f"{d['date'].strftime('%a %d %b')}: {d['hits']} of {d['total']} hit "
-                   f"({d['hits'] / d['total']:.0%})")
+                   f"({d['hits'] / d['total']:.0%}){flag}")
     latest = days[0]
     st.markdown(f"<div class='day'>{latest['date'].strftime('%A, %d %B')}</div>",
                 unsafe_allow_html=True)
