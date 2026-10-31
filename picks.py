@@ -1,8 +1,9 @@
 """Top picks: finds upcoming fixtures where the model gives a high chance of a
-home/away win, over 2.5 goals, or both-teams-score yes/no.
+home/away win, over 1.5 or 2.5 goals, or both-teams-score yes/no.
 Needs predictor_nokey.py beside it."""
 import csv
 import io
+import math
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -11,7 +12,7 @@ import predictor_nokey as p
 FIXTURES_URL = "https://www.football-data.co.uk/fixtures.csv"
 
 # A match is a "top pick" when the model gives at least this chance.
-PICK_MIN = {"win": 0.60, "over25": 0.62, "btts_yes": 0.60, "btts_no": 0.62}
+PICK_MIN = {"win": 0.70, "over15": 0.85, "over25": 0.72, "btts_yes": 0.70, "btts_no": 0.72}
 
 
 def load_fixtures():
@@ -39,6 +40,11 @@ def picks_for(pr):
         picks.append(("Home win", pr["home"]))
     if pr["away"] >= PICK_MIN["win"]:
         picks.append(("Away win", pr["away"]))
+    # Chance of 2+ total goals, from the two expected-goal values (total goals is Poisson).
+    total = pr["xg_home"] + pr["xg_away"]
+    over15 = 1 - math.exp(-total) * (1 + total)
+    if over15 >= PICK_MIN["over15"]:
+        picks.append(("Over 1.5 goals", over15))
     if pr["over25"] >= PICK_MIN["over25"]:
         picks.append(("Over 2.5 goals", pr["over25"]))
     if pr["btts"] >= PICK_MIN["btts_yes"]:
