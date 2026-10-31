@@ -35,7 +35,6 @@ st.markdown("""
 .pill {display:inline-block; border-radius:999px; padding:4px 11px; margin:0 6px 6px 0; font-size:.88rem; font-weight:600; background:#dce9ff; color:#164a9a;}
 .pill.hot {background:#d6f5df; color:#14532d;}
 .pill.lock {background:#e5e7eb; color:#555;}
-.pill.miss {background:#fde2e2; color:#7f1d1d;}
 .day {margin:18px 0 6px 0; font-weight:700; opacity:.65; text-transform:uppercase; font-size:.8rem; letter-spacing:.06em;}
 </style>
 """, unsafe_allow_html=True)
@@ -102,15 +101,6 @@ def get_picks(days):
         return pk.compute_picks(league_data(), days), None
     except RuntimeError as e:
         return None, str(e)
-    except Exception as e:
-        return None, f"Something went wrong: {e}"
-
-
-@st.cache_data(ttl=3 * 3600, show_spinner=False)
-def get_results():
-    """Returns (result, error). Back-test of the last 7 days. Cached for 3 hours."""
-    try:
-        return pk.compute_results(league_data(), 7), None
     except Exception as e:
         return None, f"Something went wrong: {e}"
 
@@ -221,22 +211,10 @@ def predictor_ui(has_access, key):
         show_locked(data, key)
 
 
-# ---------- top picks + recent results ----------
-def featured(res, has_access):
-    """Best picks + accumulator. Locked (names hidden) for visitors."""
-    best, acc = res.get("best") or [], res.get("acc")
-    if best:
-        st.markdown("### ⭐ Best picks")
-        if has_access:
-            for b in best:
-                st.markdown(
-                    f"<div class='pick'><div class='meta'>{html.escape(b['league'])} · "
-                    f"{html.escape(b['time'])}</div><div class='vs'>{html.escape(b['home'])} vs "
-                    f"{html.escape(b['away'])}</div><span class='pill hot'>"
-                    f"{html.escape(b['market'])} · {b['prob']:.0%}</span></div>",
-                    unsafe_allow_html=True)
-        else:
-            st.caption(f"🔒 The {len(best)} strongest picks of the day. Unlock to see them.")
+# ---------- top picks ----------
+def accumulator_section(res, has_access):
+    """Accumulator box. Selections are hidden from visitors who have not paid."""
+    acc = res.get("acc")
     st.markdown("### 🎯 Accumulator (odds about 5)")
     if not acc:
         st.info("Not enough suitable picks today to build an accumulator.")
@@ -272,11 +250,11 @@ def picks_tab(has_access, key):
         st.markdown(f"**🔒 {len(ms)} pick{'' if len(ms) == 1 else 's'} found. "
                     "Unlock to see which bets, the percentages and the full analysis.**")
         payment_box(key, "picks")
-    featured(res, has_access)
+    accumulator_section(res, has_access)
     if not ms:
         st.info("No high-confidence picks today. Check again later.")
     else:
-        st.markdown("### 📋 All today's picks")
+        st.markdown("### 📋 All top picks")
     day = None
     for m in ms:
         if m["date"] != day:
@@ -309,48 +287,6 @@ def picks_tab(has_access, key):
                 else:
                     show_result(data)
     st.caption("Model estimates from recent form. Not guarantees and not betting advice.")
-    results_section()
-
-
-def results_section():
-    """Recent results, visible to everyone (past picks have no betting value)."""
-    res, err = get_results()
-    if err:
-        st.error(f"Recent results could not load: {err}")
-        return
-    if not res:
-        return
-    st.markdown("### 📊 Recent results")
-    st.caption("Back-tested: the same model and pick rules re-run on the data that was "
-               "available before each match. Every pick is shown, wins and losses.")
-    if not res["total"]:
-        st.info("No finished picks to show yet.")
-        return
-    rate = res["hits"] / res["total"]
-    st.markdown(f"**Last {res['days_back']} days: {res['hits']} of {res['total']} picks "
-                f"hit ({rate:.0%})**")
-    if res.get("acc_total"):
-        st.markdown(f"**🎯 Accumulator (odds about 5): won {res['acc_won']} of "
-                    f"{res['acc_total']} days**")
-    days = [d for d in res["days"] if d["total"]]
-    for d in days:
-        acc = d.get("acc")
-        flag = f" · 🎯 {'✅' if acc['won'] else '❌'} acc" if acc else ""
-        st.caption(f"{d['date'].strftime('%a %d %b')}: {d['hits']} of {d['total']} hit "
-                   f"({d['hits'] / d['total']:.0%}){flag}")
-    latest = days[0]
-    st.markdown(f"<div class='day'>{latest['date'].strftime('%A, %d %B')}</div>",
-                unsafe_allow_html=True)
-    for m in latest["matches"]:
-        pills = "".join(
-            f"<span class='pill {'hot' if x['hit'] else 'miss'}'>"
-            f"{'✅' if x['hit'] else '❌'} {html.escape(x['market'])} · {x['prob']:.0%}</span>"
-            for x in m["picks"])
-        st.markdown(
-            f"<div class='pick'><div class='meta'>{html.escape(m['league'])} · "
-            f"Final score {html.escape(m['score'])}</div><div class='vs'>"
-            f"{html.escape(m['home'])} vs {html.escape(m['away'])}</div>{pills}</div>",
-            unsafe_allow_html=True)
 
 
 def payment_box(key, where):
