@@ -13,7 +13,9 @@ import hashlib
 import hmac
 import html
 import io
+import math
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 import streamlit as st
@@ -111,6 +113,58 @@ def get_results():
     """Returns (result, error). Back-test of the last 7 days. Cached for 3 hours."""
     try:
         return pk.compute_results(league_data(), 7), None
+    except Exception as e:
+        return None, f"Something went wrong: {e}"
+
+
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def get_all_matches():
+    """Every upcoming fixture (next 7 days) in every league we have data for, with the
+    model's prediction. Returns (result, error). Cached for 3 hours."""
+    try:
+        fixtures = pk.load_fixtures()
+        cache = league_data()
+        today = datetime.now(timezone.utc).date()
+        end = today + timedelta(days=7)
+        per_div, out, skipped = {}, [], 0
+        for f in fixtures:
+            if not (today <= f["date"] < end):
+                continue
+            div = f["div"]
+            if div not in per_div:
+                rows = cache.get(div) or []
+                names = {r["home"] for r in rows} | {r["away"] for r in rows}
+                ratings, avg = p.ratings_from(rows) if rows else ({}, p.DEFAULT_AVG_GOALS)
+                per_div[div] = (rows, names, ratings, avg, p.shot_ratings_from(rows))
+            rows, names, ratings, avg, shot = per_div[div]
+            if not rows:
+                skipped += 1
+                continue
+
+            def resolve(q):
+                if q in names:
+                    return q
+                hits = p.find_team_names(q, rows)
+                return hits[0] if hits else None
+
+            home, away = resolve(f["home"]), resolve(f["away"])
+            if not home or not away or home == away:
+                skipped += 1
+                continue
+            hm, am = p.last_matches(home, rows), p.last_matches(away, rows)
+            if len(hm) < 3 or len(am) < 3:
+                skipped += 1
+                continue
+            pr = p.predict(p.summarise(hm, ratings, True, shot),
+                           p.summarise(am, ratings, False, shot), avg)
+            total = pr["xg_home"] + pr["xg_away"]
+            out.append({"date": f["date"], "time": f["time"], "div": div,
+                        "league": p.LEAGUES.get(div, div), "home": home, "away": away,
+                        "pr": pr, "over15": 1 - math.exp(-total) * (1 + total)})
+        out.sort(key=lambda m: (m["date"], m["time"] or "99:99", m["league"]))
+        return {"matches": out, "skipped": skipped}, None
+    except RuntimeError as e:
+        return None, str(e)
     except Exception as e:
         return None, f"Something went wrong: {e}"
 
@@ -318,7 +372,7 @@ def picks_tab(has_access, key):
             f"<div class='pick'><div class='meta'>{html.escape(m['league'])} · "
             f"{html.escape(m['time'])}</div><div class='vs'>{html.escape(m['home'])} vs "
             f"{html.escape(m['away'])}</div>{pills}</div>", unsafe_allow_html=True)
-        if has_access:
+        if has_access or i in free_ids:
             pid = f"{m['home']}|{m['away']}"
             opened = st.session_state.get("open_pick") == pid
             if st.button("✖ Close analysis" if opened else "📈 See analysis",
@@ -333,6 +387,80 @@ def picks_tab(has_access, key):
                 else:
                     show_result(data)
     st.caption("Model estimates from recent form. Not guarantees and not betting advice.")
+
+
+def all_tab(has_access, key):
+    """Every league: all upcoming fixtures. Full predictions for paid clients only."""
+    with st.spinner("Loading all leagues (first time can take ~30 seconds)..."):
+        res, err = get_all_matches()
+    if err:
+        st.error(err)
+        return
+    ms = res["matches"]
+    if not ms:
+        st.info("No upcoming fixtures found in the data right now. Check again later.")
+        return
+    today = datetime.now(timezone.utc).date()
+    span = st.radio("Show matches", ["Today", "Tomorrow", "Next 3 days", "Next 7 days"],
+                    horizontal=True, key="all_span")
+    first, last = {"Today": (0, 1), "Tomorrow": (1, 2), "Next 3 days": (0, 3),
+                   "Next 7 days": (0, 7)}[span]
+    ms = [m for m in ms if today + timedelta(days=first) <= m["date"] < today + timedelta(days=last)]
+    leagues = sorted({m["league"] for m in ms})
+    pick = st.selectbox("League", ["All leagues"] + leagues, key="all_league")
+    if pick != "All leagues":
+        ms = [m for m in ms if m["league"] == pick]
+    st.caption(f"{len(ms)} match{'' if len(ms) == 1 else 'es'} · "
+               f"{len({m['league'] for m in ms})} league(s). Times are UK time.")
+    if not has_access:
+        st.markdown("**🔒 Predictions for every league are for paying clients. "
+                    "Unlock to see the predicted score, win chances, goals and "
+                    "full analysis for each match below.**")
+        payment_box(key, "all")
+    if not ms:
+        st.info("No matches for this choice.")
+        return
+    day = None
+    for m in ms:
+        if m["date"] != day:
+            day = m["date"]
+            st.markdown(f"<div class='day'>{day.strftime('%A, %d %B')}</div>",
+                        unsafe_allow_html=True)
+        head = (f"<div class='meta'>{html.escape(m['league'])} · {html.escape(m['time'])}</div>"
+                f"<div class='vs'>{html.escape(m['home'])} vs {html.escape(m['away'])}</div>")
+        if has_access:
+            pr = m["pr"]
+            (i, j), _ = pr["top"][0]
+            pills = (f"<span class='pill hot'>Score {i}-{j}</span>"
+                     f"<span class='pill'>1 {pr['home']:.0%}</span>"
+                     f"<span class='pill'>X {pr['draw']:.0%}</span>"
+                     f"<span class='pill'>2 {pr['away']:.0%}</span>"
+                     f"<span class='pill'>xG {pr['xg_home']:.1f}-{pr['xg_away']:.1f}</span>"
+                     f"<span class='pill'>Over 1.5 {m['over15']:.0%}</span>"
+                     f"<span class='pill'>Over 2.5 {pr['over25']:.0%}</span>"
+                     f"<span class='pill'>BTTS {pr['btts']:.0%}</span>")
+        else:
+            pills = "<span class='pill lock'>🔒 Prediction locked</span>"
+        st.markdown(f"<div class='pick'>{head}{pills}</div>", unsafe_allow_html=True)
+        if has_access:
+            pid = f"{m['home']}|{m['away']}"
+            opened = st.session_state.get("open_all") == pid
+            if st.button("✖ Close analysis" if opened else "📈 See analysis",
+                         key=f"all_{pid}", use_container_width=True):
+                st.session_state["open_all"] = None if opened else pid
+                st.rerun()
+            if opened:
+                with st.spinner("Loading analysis..."):
+                    data, aerr = compute(m["home"], m["away"])
+                if aerr:
+                    st.error(aerr)
+                else:
+                    show_result(data)
+    if res["skipped"]:
+        st.caption(f"{res['skipped']} fixture(s) left out because there is not enough "
+                   "recent data for one of the teams.")
+    st.caption("1 = home win, X = draw, 2 = away win. Model estimates from recent form. "
+               "Not guarantees and not betting advice.")
 
 
 def results_tab():
@@ -433,11 +561,14 @@ if not has_access:
         st.session_state.pop("code", None)
 
 st.title("⚽ Score Predictor")
-tab_picks, tab_results, tab_pred = st.tabs(["🔥 Top picks", "📊 Results", "🔍 Predict a match"])
+tab_picks, tab_all, tab_results, tab_pred = st.tabs(
+    ["🔥 Top picks", "🌍 All leagues", "📊 Results", "🔍 Predict a match"])
 with tab_picks:
     picks_tab(has_access, key)
+with tab_all:
+    all_tab(has_access, key)
 with tab_results:
     results_tab()
 with tab_pred:
     predictor_ui(has_access, key)
-owner_panel(key, admin_pw)
+owner_panel(key, admin_pw) 
