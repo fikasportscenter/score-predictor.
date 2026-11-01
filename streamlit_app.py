@@ -7,18 +7,14 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
   PRICE_TEXT       = "UGX 2,000 per day"
   PAY_INSTRUCTIONS = "Send to MTN MoMo 07XXXXXXXX (Your Name)"
   WHATSAPP_NUMBER  = "2567XXXXXXXX"      (international format, no +)
-  API_FOOTBALL_KEY = "your api-sports key"   (only for the owner's API test)
 """
 import contextlib
 import hashlib
 import hmac
 import html
 import io
-import json
 import math
 import time
-import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
@@ -529,80 +525,6 @@ def payment_box(key, where):
             st.error(info)
 
 
-def api_test_panel():
-    """Owner only: checks what the API-Football key can see. Delete this whole function
-    (and the api_test_panel() call in owner_panel) if you do not need it."""
-    akey = secret("API_FOOTBALL_KEY")
-    if not akey:
-        st.warning("Add API_FOOTBALL_KEY in the app's Secrets to use this test.")
-        return
-
-    def call(path, **params):
-        url = "https://v3.football.api-sports.io/" + path
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={"x-apisports-key": akey})
-        try:
-            with urllib.request.urlopen(req, timeout=25) as r:
-                return json.loads(r.read().decode("utf-8")), None
-        except Exception as e:
-            return None, str(e)
-
-    def tick(v):
-        return "✅" if v else "❌"
-
-    if st.button("Check my API account", key="api_status"):
-        data, err = call("status")
-        if err:
-            st.error(f"Could not reach the service: {err}")
-        else:
-            resp = data.get("response") or {}
-            if not resp:
-                st.error(f"The service did not accept the key: {data.get('errors')}")
-            else:
-                sub, req = resp.get("subscription", {}), resp.get("requests", {})
-                st.success(f"Key works. Plan: {sub.get('plan', '?')} · "
-                           f"requests today: {req.get('current', '?')} of {req.get('limit_day', '?')}")
-    st.caption("Is my league covered? Type a country (Uganda, Kenya, England) or a league name.")
-    term = st.text_input("Country or league", placeholder="Uganda", key="api_term")
-    if st.button("Search leagues", key="api_search"):
-        if len(term.strip()) < 3:
-            st.warning("Type at least 3 letters.")
-            return
-        found, errors = {}, []
-        for params in ({"country": term.strip()}, {"search": term.strip()}):
-            data, err = call("leagues", **params)
-            if err:
-                errors.append(err)
-                continue
-            if data.get("errors") and not data.get("response"):
-                errors.append(str(data["errors"]))
-            for item in data.get("response") or []:
-                found[item["league"]["id"]] = item
-        if not found:
-            st.info("Nothing found. " + (" ".join(errors) if errors else "Try another spelling."))
-            return
-        rows = ["| Country | League | Type | Season | Events | Lineups | Match stats | Player stats | Odds |",
-                "|---|---|---|---|---|---|---|---|---|"]
-        for item in list(found.values())[:40]:
-            seasons = item.get("seasons") or []
-            if not seasons:
-                continue
-            s = max(seasons, key=lambda x: x.get("year", 0))
-            cov = s.get("coverage") or {}
-            fx = cov.get("fixtures") or {}
-            rows.append(
-                f"| {html.escape(str(item['country'].get('name', '')))} "
-                f"| {html.escape(str(item['league'].get('name', '')))} "
-                f"| {item['league'].get('type', '')} | {s.get('year', '')} "
-                f"| {tick(fx.get('events'))} | {tick(fx.get('lineups'))} "
-                f"| {tick(fx.get('statistics_fixtures'))} | {tick(fx.get('statistics_players'))} "
-                f"| {tick(cov.get('odds'))} |")
-        st.markdown("\n".join(rows))
-        st.caption(f"{len(found)} competition(s) found. ✅ = the service says it provides "
-                   "it for that league. ❌ = not provided.")
-
-
 def owner_panel(key, admin_pw):
     with st.expander("Owner login"):
         if not st.session_state.get("admin_ok"):
@@ -623,9 +545,6 @@ def owner_panel(key, admin_pw):
                          f"Thank you! Your Score Predictor access code is:\n{code}\n"
                          f"Valid for {label.split(' (')[0].lower()} from now. "
                          "Enter it on the site and tap Unlock.")
-        st.divider()
-        st.markdown("**🧪 API coverage test (owner only)**")
-        api_test_panel()
         if st.button("Log out"):
             st.session_state["admin_ok"] = False
             st.rerun()
