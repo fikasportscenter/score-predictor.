@@ -477,6 +477,14 @@ def results_tab():
     st.caption("Tap a date to see every pick for that day, marked ✅ hit or ❌ miss. "
                "Back-tested: the same model and rules re-run on the data that was "
                "available before each match. Wins and losses are all shown.")
+    try:
+        latest = max(r["date"].date() for rows in league_data().values() for r in rows)
+        if latest < datetime.now(timezone.utc).date() - timedelta(days=1):
+            st.info(f"📅 Our results data is up to {latest.strftime('%a %d %b')}. "
+                    "Newer days appear here automatically when the data provider "
+                    "updates it, usually within a few days.")
+    except Exception:
+        pass
     labels = {d["date"].strftime("%a %d %b"): d for d in days}
     choice = st.radio("Choose a date", list(labels), horizontal=True)
     d = labels[choice]
@@ -571,4 +579,4 @@ with tab_results:
     results_tab()
 with tab_pred:
     predictor_ui(has_access, key)
-owner_panel(key, admin_pw) 
+owner_panel(key, admin_pw)
