@@ -1,5 +1,5 @@
 """Football score predictor - paid access (access codes). Phone-friendly Streamlit app.
-Needs predictor_nokey.py and picks.py beside it.
+Needs predictor_nokey.py beside it.
 
 Secrets to set in Streamlit (Manage app > Settings > Secrets):
   CODE_SECRET      = "long random text, keep private"
@@ -128,7 +128,8 @@ def compute(home_q, away_q):
         hm, am = p.last_matches(hn, pool), p.last_matches(an, pool)
         if len(hm) < 3 or len(am) < 3:
             return None, "Not enough recent matches found for one of the teams."
-        hs, as_ = p.summarise(hm, ratings, True), p.summarise(am, ratings, False)
+        shot = p.shot_ratings_from(pool)
+        hs, as_ = p.summarise(hm, ratings, True, shot), p.summarise(am, ratings, False, shot)
         return {"home": hn, "away": an, "hm": hm, "am": am,
                 "hs": hs, "as": as_, "pred": p.predict(hs, as_, avg)}, None
     except (SystemExit, RuntimeError) as e:
@@ -160,6 +161,54 @@ def team_card(name, matches, s, playing_home):
                    f"{s['venue_gf']:.2f} scored / {s['venue_ga']:.2f} conceded.")
 
 
+STAT_ROWS = [  # (label, key, kind)
+    ("Goals scored per match", "goals_for", "2"),
+    ("Goals conceded per match", "goals_against", "2"),
+    ("Average goals (both teams, per match)", "avg_goals", "2"),
+    ("Failed to score (of last 6)", "failed_to_score", "int"),
+    ("Shots taken per match", "shots", "1"),
+    ("Shots faced per match", "shots_against", "1"),
+    ("Avg. shots on target", "sot", "1"),
+    ("Avg. shots on target against", "sot_against", "1"),
+    ("Avg. shots off target", "off_target", "1"),
+    ("Shots off/on-target ratio", "off_on_ratio", "2"),
+    ("Avg. shots per goal", "shots_per_goal", "1"),
+    ("Shooting conversion rate", "conversion", "pct"),
+    ("Scoring efficiency (goals per shot on target)", "scoring_eff", "pct"),
+    ("Conceding efficiency (goals per shot on target faced)", "conceding_eff", "pct"),
+    ("Avg. corners", "corners", "1"),
+    ("Avg. corners against", "corners_against", "1"),
+    ("Avg. fouls", "fouls", "1"),
+    ("Avg. yellow cards", "yellows", "2"),
+    ("Avg. red cards", "reds", "2"),
+]
+
+
+def _fmt_stat(v, kind):
+    if v is None:
+        return "n/a"
+    if kind == "int":
+        return str(int(v))
+    if kind == "pct":
+        return f"{v:.0%}"
+    return f"{v:.{kind}f}"
+
+
+def stats_table(data):
+    hs, as_ = data["hs"]["stats"], data["as"]["stats"]
+    rows = [f"| Last 6 matches | {data['home']} | {data['away']} |", "|---|---|---|"]
+    for label, key, kind in STAT_ROWS:
+        rows.append(f"| {label} | {_fmt_stat(hs.get(key), kind)} | {_fmt_stat(as_.get(key), kind)} |")
+    st.markdown("\n".join(rows))
+    short = [n for n in (hs["n_shots"], as_["n_shots"]) if n < hs["n"]]
+    if short:
+        st.caption("Shot figures use only the matches where the data has them "
+                   f"({data['home']}: {hs['n_shots']} of {hs['n']}, "
+                   f"{data['away']}: {as_['n_shots']} of {as_['n']}). 'n/a' = not in the data.")
+    st.caption("Not available in the free data: possession, attacks, dangerous attacks, "
+               "shots inside/outside the box, goal kicks, penalties, offsides.")
+
+
 def show_result(data):
     pr = data["pred"]
     (i, j), prob = pr["top"][0]
@@ -178,6 +227,8 @@ def show_result(data):
     c1, c2 = st.columns(2)
     c1.metric("Over 2.5 goals", f"{pr['over25']:.0%}")
     c2.metric("Both teams score", f"{pr['btts']:.0%}")
+    with st.expander("📊 Team stats (last 6 matches)", expanded=True):
+        stats_table(data)
     with st.expander(f"{data['home']} - last 6 matches", expanded=True):
         team_card(data["home"], data["hm"], data["hs"], True)
     with st.expander(f"{data['away']} - last 6 matches", expanded=True):
@@ -221,7 +272,10 @@ def predictor_ui(has_access, key):
         show_locked(data, key)
 
 
-# ---------- top picks ----------
+# ---------- paywall screens ----------
+FREE_PICKS = 2   # how many matches free visitors see in full on the Top picks tab
+
+
 def picks_tab(has_access, key):
     with st.spinner("Loading today's picks (first time can take ~30 seconds)..."):
         res, err = get_picks(1)
@@ -232,22 +286,29 @@ def picks_tab(has_access, key):
     st.caption(f"Today · {len(ms)} high-confidence pick"
                f"{'' if len(ms) == 1 else 's'} from {res['analysed']} matches analysed. "
                "Times are UK time.")
+    # Free visitors get the FREE_PICKS strongest matches in full; the rest stay locked.
+    best = sorted(range(len(ms)), key=lambda i: -ms[i]["picks"][0][1])
+    free_ids = set() if has_access else set(best[:FREE_PICKS])
     if not has_access:
-        st.markdown(f"**🔒 {len(ms)} pick{'' if len(ms) == 1 else 's'} found. "
-                    "Unlock to see which bets, the percentages and the full analysis.**")
+        locked_n = len(ms) - len(free_ids)
+        if locked_n > 0:
+            st.markdown(f"**🎁 Here are {len(free_ids)} free picks. "
+                        f"🔒 {locked_n} more are locked. Unlock to see them, "
+                        "the percentages and the full analysis.**")
         payment_box(key, "picks")
     if not ms:
         st.info("No high-confidence picks today. Check again later.")
     else:
         st.markdown("### 📋 All top picks")
     day = None
-    for m in ms:
+    for i, m in enumerate(ms):
         if m["date"] != day:
             day = m["date"]
             st.markdown(f"<div class='day'>{day.strftime('%A, %d %B')}</div>",
                         unsafe_allow_html=True)
-        if has_access:
-            pills = "".join(
+        if has_access or i in free_ids:
+            free_tag = "" if has_access else "<span class='pill hot'>🎁 FREE</span>"
+            pills = free_tag + "".join(
                 f"<span class='pill{' hot' if pr >= 0.75 else ''}'>{html.escape(mk)} · {pr:.0%}</span>"
                 for mk, pr in m["picks"])
         else:
@@ -274,7 +335,6 @@ def picks_tab(has_access, key):
     st.caption("Model estimates from recent form. Not guarantees and not betting advice.")
 
 
-# ---------- results of past days ----------
 def results_tab():
     """Past results. Visible to everyone: old picks have no betting value."""
     with st.spinner("Loading results (first time can take ~30 seconds)..."):
