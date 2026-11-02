@@ -597,7 +597,7 @@ def predictor_ui(has_access, key):
 
 
 # ---------- paywall screens ----------
-FREE_PICKS = 2   # how many matches free visitors see in full on the Top picks tab
+FREE_PICKSh.1   # how many matches free visitors see in full on the Top picks tab
 
 
 def picks_tab(has_access, key):
