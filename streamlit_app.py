@@ -49,9 +49,6 @@ st.markdown("""
 .pill.lock {background:#e5e7eb; color:#555;}
 .pill.miss {background:#fde2e2; color:#7f1d1d;}
 .day {margin:18px 0 6px 0; font-weight:700; opacity:.65; text-transform:uppercase; font-size:.8rem; letter-spacing:.06em;}
-/* keep the title and the virtual match side by side, even on a phone */
-div[data-testid="stHorizontalBlock"]:has(iframe) {flex-wrap:nowrap !important; gap:.5rem;}
-div[data-testid="stHorizontalBlock"]:has(iframe) > div[data-testid="stColumn"] {min-width:0 !important;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -60,11 +57,12 @@ PASSES = {"Daily (24 hours)": 24, "Weekly (7 days)": 24 * 7, "Monthly (30 days)"
 # ---------- virtual live match (simulation, shown beside the title) ----------
 VIRTUAL_HTML = """
 <style>
- body{margin:0;font-family:sans-serif}
- #w{background:#0b3d1e;border-radius:12px;padding:6px;color:#fff;text-align:center}
- #hd{font:700 10px sans-serif;letter-spacing:.08em;color:#ffd43b}
- #sc{font:800 14px sans-serif;margin:2px 0}
- canvas{width:100%;height:170px;display:block;border-radius:8px}
+ body{margin:0;font-family:sans-serif;background:transparent}
+ #w{background:#0b3d1e;border-radius:12px;padding:8px;color:#fff;text-align:center;
+    max-width:420px;margin:0 auto}
+ #hd{font:700 11px sans-serif;letter-spacing:.08em;color:#ffd43b}
+ #sc{font:800 16px sans-serif;margin:3px 0 5px 0}
+ canvas{width:100%;aspect-ratio:16/9;display:block;border-radius:8px}
 </style>
 <div id="w">
  <div id="hd">🔴 LIVE · VIRTUAL MATCH</div>
@@ -76,20 +74,21 @@ const TEAMS=[["ARS","#e03131"],["CHE","#1c7ed6"],["MCI","#74c0fc"],["LIV","#c92a
  ["BAR","#7048e8"],["RMA","#f1f3f5"],["INT","#1864ab"],["BAY","#fa5252"]];
 const c=document.getElementById('c'),g=c.getContext('2d'),sc=document.getElementById('sc');
 function fit(){c.width=c.clientWidth*2;c.height=c.clientHeight*2}
-fit();
-const base=[[.5,.93],[.25,.74],[.75,.74],[.35,.52],[.65,.52]];
+fit();addEventListener('resize',()=>{fit();draw()});
+// team 0 defends the left goal and attacks right; team 1 is the mirror image
+const base=[[.07,.5],[.25,.28],[.25,.72],[.46,.38],[.46,.62]];
 let A,B,score,min,ball,tgt,poss,pl,pause,pause2=0;
 function start(){
   const i=Math.floor(Math.random()*8);let j;do{j=Math.floor(Math.random()*8)}while(j==i);
   A=TEAMS[i];B=TEAMS[j];score=[0,0];min=0;poss=0;pause=0;
   pl=[base.map(p=>({x:p[0],y:p[1],hx:p[0],hy:p[1]})),
-      base.map(p=>({x:p[0],y:1-p[1],hx:p[0],hy:1-p[1]}))];
+      base.map(p=>({x:1-p[0],y:p[1],hx:1-p[0],hy:p[1]}))];
   ball={x:.5,y:.5};tgt={x:.5,y:.5,shot:false};
   draw();
 }
 function newTarget(){
-  const atkY=poss==0?0:1;
-  if(Math.random()<.14){tgt={x:.5+(Math.random()-.5)*.2,y:atkY,shot:true}}
+  const atkX=poss==0?1:0;
+  if(Math.random()<.14){tgt={x:atkX,y:.5+(Math.random()-.5)*.2,shot:true}}
   else{const k=1+Math.floor(Math.random()*4),p=pl[poss][k];tgt={x:p.x,y:p.y,shot:false}}
 }
 function step(){
@@ -100,7 +99,7 @@ function step(){
     if(tgt.shot){
       if(Math.random()<.4){score[poss]++;pause=20;
         ball={x:.5,y:.5};poss=1-poss;
-      }else{poss=1-poss;ball.y=poss==0?.85:.15}
+      }else{poss=1-poss;ball.x=poss==0?.15:.85;ball.y=.5}
     }else if(Math.random()<.2)poss=1-poss;
     newTarget();
   }else{ball.x+=dx/d*s;ball.y+=dy/d*s}
@@ -113,17 +112,20 @@ function step(){
 function draw(){
   const W=c.width,H=c.height;
   g.fillStyle='#2f9e44';g.fillRect(0,0,W,H);
-  g.strokeStyle='rgba(255,255,255,.7)';g.lineWidth=2;
+  g.fillStyle='rgba(255,255,255,.05)';
+  for(let k=0;k<8;k+=2)g.fillRect(k*W/8,0,W/8,H);
+  g.strokeStyle='rgba(255,255,255,.75)';g.lineWidth=2;
   g.strokeRect(6,6,W-12,H-12);
-  g.beginPath();g.moveTo(6,H/2);g.lineTo(W-6,H/2);g.stroke();
-  g.beginPath();g.arc(W/2,H/2,H*.1,0,7);g.stroke();
-  g.strokeRect(W*.25,6,W*.5,H*.14);g.strokeRect(W*.25,H*.86-6,W*.5,H*.14);
+  g.beginPath();g.moveTo(W/2,6);g.lineTo(W/2,H-6);g.stroke();
+  g.beginPath();g.arc(W/2,H/2,H*.16,0,7);g.stroke();
+  g.strokeRect(6,H*.22,W*.14,H*.56);g.strokeRect(W*.86-6,H*.22,W*.14,H*.56);
+  g.strokeRect(6,H*.38,W*.05,H*.24);g.strokeRect(W*.95-6,H*.38,W*.05,H*.24);
   [[A[1],0],[B[1],1]].forEach(([col,ti])=>{
     g.fillStyle=col;
-    pl[ti].forEach(p=>{g.beginPath();g.arc(p.x*W,p.y*H,7,0,7);g.fill();
-      g.strokeStyle='#fff';g.stroke()});
+    pl[ti].forEach(p=>{g.beginPath();g.arc(p.x*W,p.y*H,9,0,7);g.fill();
+      g.strokeStyle='#fff';g.lineWidth=2;g.stroke()});
   });
-  g.fillStyle='#fff';g.beginPath();g.arc(ball.x*W,ball.y*H,5,0,7);g.fill();
+  g.fillStyle='#fff';g.beginPath();g.arc(ball.x*W,ball.y*H,6,0,7);g.fill();
   g.strokeStyle='#000';g.lineWidth=1.5;g.stroke();
   sc.textContent=A[0]+' '+score[0]+' - '+score[1]+' '+B[0]+'  ·  '+
     (min>=90?'FT':Math.floor(min)+"'");
@@ -896,12 +898,8 @@ if not has_access:
         st.warning(info)
         st.session_state.pop("code", None)
 
-# Title on the left, virtual live match on the right
-title_col, match_col = st.columns([3, 2])
-with title_col:
-    st.markdown("## ⚽ Score Predictor")
-with match_col:
-    components.html(VIRTUAL_HTML, height=235)
+st.title("⚽ Score Predictor")
+components.html(VIRTUAL_HTML, height=290)
 
 tab_picks, tab_all, tab_results, tab_pred = st.tabs(
     ["🔥 Top picks", "🌍 All leagues", "📊 Results", "🔍 Predict a match"])
