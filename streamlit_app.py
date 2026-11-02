@@ -7,7 +7,12 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
   PRICE_TEXT       = "UGX 2,000 per day"
   PAY_INSTRUCTIONS = "Send to MTN MoMo 07XXXXXXXX (Your Name)"
   WHATSAPP_NUMBER  = "2567XXXXXXXX"      (international format, no +)
-  API_FOOTBALL_KEY = "your api-sports key"   (only for the owner's API test)
+  API_FOOTBALL_KEY = "your api-sports key"   (API test, and API data if DATA_SOURCE = "api")
+  FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (adds same-day results)
+  DATA_SOURCE      = "api"            (optional: use API-Football for fixtures/results)
+  API_MAX_LEAGUES  = "8"              (optional: leagues fetched per refresh; raise on a paid plan)
+  API_DAYS         = "3"              (optional: days of fixtures, 1-7)
+  API_PER_MIN      = "10"             (optional: requests per minute allowed by your plan)
 """
 import contextlib
 import hashlib
@@ -17,10 +22,12 @@ import io
 import json
 import math
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -89,15 +96,274 @@ def time_left_text(seconds):
     return (f"{d}d {h}h" if d else f"{h}h {m}m")
 
 
+# ---------- live results from football-data.org (optional, free key) ----------
+FD_ORG = {"PL": "E0", "ELC": "E1", "PD": "SP1", "SA": "I1", "BL1": "D1",
+          "FL1": "F1", "DED": "N1", "PPL": "P1"}      # football-data.org code -> our league code
+FD_ALIASES = {   # their spelling -> spelling used in our data
+    "manchester united": "Man United", "manchester city": "Man City",
+    "nottingham forest": "Nott'm Forest", "wolverhampton wanderers": "Wolves",
+    "wolverhampton": "Wolves", "tottenham hotspur": "Tottenham", "newcastle united": "Newcastle",
+    "brighton hove albion": "Brighton", "brighton": "Brighton", "west ham united": "West Ham",
+    "leeds united": "Leeds", "leicester city": "Leicester", "ipswich town": "Ipswich",
+    "luton town": "Luton", "sheffield united": "Sheffield United", "norwich city": "Norwich",
+    "cardiff city": "Cardiff", "swansea city": "Swansea", "stoke city": "Stoke",
+    "hull city": "Hull", "coventry city": "Coventry", "birmingham city": "Birmingham",
+    "queens park rangers": "QPR", "west bromwich albion": "West Brom",
+    "sheffield wednesday": "Sheffield Weds", "preston north end": "Preston",
+    "oxford united": "Oxford", "derby county": "Derby", "bristol city": "Bristol City",
+    "atletico madrid": "Ath Madrid", "club atletico de madrid": "Ath Madrid",
+    "athletic club": "Ath Bilbao", "real sociedad": "Sociedad", "real betis": "Betis",
+    "rayo vallecano": "Vallecano", "celta vigo": "Celta", "rc celta": "Celta",
+    "deportivo alaves": "Alaves", "rcd espanyol": "Espanol", "espanyol": "Espanol",
+    "real valladolid": "Valladolid", "ud las palmas": "Las Palmas", "cd leganes": "Leganes",
+    "internazionale": "Inter", "internazionale milano": "Inter", "fc internazionale milano": "Inter",
+    "ac milan": "Milan", "as roma": "Roma", "ssc napoli": "Napoli", "ss lazio": "Lazio",
+    "hellas verona": "Verona", "bayern munchen": "Bayern Munich", "fc bayern munchen": "Bayern Munich",
+    "borussia monchengladbach": "M'gladbach", "borussia dortmund": "Dortmund",
+    "bayer 04 leverkusen": "Leverkusen", "bayer leverkusen": "Leverkusen",
+    "eintracht frankfurt": "Ein Frankfurt", "rb leipzig": "RB Leipzig", "vfb stuttgart": "Stuttgart",
+    "1 fc union berlin": "Union Berlin", "fc augsburg": "Augsburg", "sc freiburg": "Freiburg",
+    "tsg 1899 hoffenheim": "Hoffenheim", "vfl wolfsburg": "Wolfsburg", "vfl bochum 1848": "Bochum",
+    "werder bremen": "Werder Bremen", "1 fsv mainz 05": "Mainz", "fc st pauli 1910": "St Pauli",
+    "1 fc heidenheim 1846": "Heidenheim", "holstein kiel": "Holstein Kiel",
+    "paris saint germain": "Paris SG", "olympique de marseille": "Marseille",
+    "olympique lyonnais": "Lyon", "as monaco": "Monaco", "losc lille": "Lille",
+    "stade rennais": "Rennes", "stade brestois 29": "Brest", "ogc nice": "Nice",
+    "rc strasbourg alsace": "Strasbourg", "stade de reims": "Reims", "as saint etienne": "St Etienne",
+    "psv": "PSV Eindhoven", "sc heerenveen": "Heerenveen", "fc utrecht": "Utrecht",
+    "az": "AZ Alkmaar", "go ahead eagles": "Go Ahead Eagles", "fc twente": "Twente",
+    "fc groningen": "Groningen", "sparta rotterdam": "Sparta Rotterdam", "nec": "Nijmegen",
+    "sporting clube de portugal": "Sporting", "sporting cp": "Sporting", "sl benfica": "Benfica",
+    "fc porto": "Porto", "sporting clube de braga": "Sp Braga", "sc braga": "Sp Braga",
+    "vitoria sc": "Guimaraes", "vitoria guimaraes": "Guimaraes",
+}
+_FD_STOP = {"fc", "afc", "cf", "ac", "as", "ssc", "sc", "rc", "rcd", "ud", "cd", "ca", "us", "fk",
+            "sv", "vfb", "vfl", "tsg", "fsv", "1", "04", "05", "96", "1899", "1846", "de", "calcio"}
+
+
+def _fold(s):
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode().lower()
+    return " ".join("".join(c if c.isalnum() else " " for c in s).split())
+
+
+def _toks(s):
+    return {t for t in _fold(s).split() if t not in _FD_STOP}
+
+
+def match_team(api_names, csv_names):
+    """Find our spelling of a team from football-data.org's name(s), or None if unsure."""
+    for n in api_names:
+        f = _fold(n)
+        short = " ".join(w for w in f.split() if w not in ("fc", "afc", "cf"))
+        for key in (f, short):
+            a = FD_ALIASES.get(key)
+            if a and a in csv_names:
+                return a
+    best, score, ties = None, 0, 0
+    for n in api_names:
+        at = _toks(n)
+        for c in csv_names:
+            ct = _toks(c)
+            if not at or not ct or not (ct <= at or at <= ct):
+                continue
+            sc = len(ct & at)
+            if sc > score:
+                best, score, ties = c, sc, 1
+            elif sc == score and c != best:
+                ties += 1
+    return best if score and ties == 1 else None
+
+
+def merge_live_results(cache):
+    """Adds finished matches of the last 9 days from football-data.org to the league
+    data. Needs FOOTBALL_DATA_ORG_KEY in Secrets. Never raises: on any problem the
+    normal data is used unchanged. Returns the number of matches added."""
+    token = secret("FOOTBALL_DATA_ORG_KEY")
+    if not token:
+        return 0
+    try:
+        today = datetime.now(timezone.utc).date()
+        q = urllib.parse.urlencode({"dateFrom": (today - timedelta(days=9)).isoformat(),
+                                    "dateTo": (today + timedelta(days=1)).isoformat(),
+                                    "status": "FINISHED"})
+        req = urllib.request.Request("https://api.football-data.org/v4/matches?" + q,
+                                     headers={"X-Auth-Token": token})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        added = 0
+        names = {}
+        for m in data.get("matches") or []:
+            div = FD_ORG.get((m.get("competition") or {}).get("code"))
+            ft = ((m.get("score") or {}).get("fullTime")) or {}
+            if not div or ft.get("home") is None or ft.get("away") is None:
+                continue
+            rows = cache.get(div)
+            if not rows:
+                continue
+            if div not in names:
+                names[div] = {r["home"] for r in rows} | {r["away"] for r in rows}
+            h, a = m.get("homeTeam") or {}, m.get("awayTeam") or {}
+            home = match_team([h.get("name"), h.get("shortName")], names[div])
+            away = match_team([a.get("name"), a.get("shortName")], names[div])
+            if not home or not away or home == away:
+                continue
+            d = datetime.strptime(m["utcDate"][:10], "%Y-%m-%d")
+            if any(r["home"] == home and r["away"] == away and abs((r["date"] - d).days) <= 2
+                   for r in rows):
+                continue
+            row = {"date": d, "home": home, "away": away,
+                   "hg": int(ft["home"]), "ag": int(ft["away"])}
+            for k in p.STAT_COLS:
+                row[k] = None
+            rows.append(row)
+            added += 1
+        return added
+    except Exception:
+        return 0
+
+
+# ---------- API-Football data source (optional: DATA_SOURCE = "api") ----------
+@st.cache_resource(show_spinner=False)
+def _api_holder():
+    """Created once per running app (before any switching), so the original free-data
+    settings and the last API status survive Streamlit's re-runs."""
+    return {"state": {"mode": "csv", "note": "not loaded yet", "calls": 0, "leagues": 0,
+                      "fixtures": 0},
+            "leagues": dict(p.LEAGUES), "fixtures": pk.load_fixtures}
+
+
+_HOLDER = _api_holder()
+API_STATE = _HOLDER["state"]
+_ORIG_LEAGUES = _HOLDER["leagues"]
+_ORIG_FIXTURES = _HOLDER["fixtures"]
+_SKIP = {"PST", "CANC", "ABD", "AWD", "WO", "SUSP", "INT"}
+
+
+def _api_call(path, params, st_):
+    """One throttled call to API-Football. Returns (list_of_items, error_text)."""
+    akey = secret("API_FOOTBALL_KEY")
+    try:
+        per_min = max(1, int(secret("API_PER_MIN", "10") or 10))
+    except ValueError:
+        per_min = 10
+    url = "https://v3.football.api-sports.io/" + path + "?" + urllib.parse.urlencode(params)
+    for attempt in (1, 2):
+        wait = 60.0 / per_min - (time.time() - st_["last"])
+        if wait > 0:
+            time.sleep(wait)
+        st_["last"] = time.time()
+        st_["calls"] += 1
+        try:
+            req = urllib.request.Request(url, headers={"x-apisports-key": akey})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            return None, str(e)
+        errs = data.get("errors")
+        if errs and not data.get("response"):
+            text = str(errs)
+            if attempt == 1 and "rate" in text.lower():
+                time.sleep(61)          # per-minute limit hit: wait a minute, try once more
+                continue
+            return None, text
+        return data.get("response") or [], None
+    return None, "rate limit"
+
+
+def _api_when(iso):
+    """API date text -> (UTC datetime, UK-time datetime)."""
+    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return dt.astimezone(timezone.utc), dt.astimezone(ZoneInfo("Europe/London"))
+
+
+def build_from_api():
+    """Returns (league_cache, league_names, fixtures). Raises RuntimeError with a plain
+    reason when the API cannot be used (the caller then falls back to the free data)."""
+    st_ = {"last": 0.0, "calls": 0}
+    try:
+        days = max(1, min(7, int(secret("API_DAYS", "3") or 3)))
+        max_leagues = max(1, int(secret("API_MAX_LEAGUES", "8") or 8))
+    except ValueError:
+        days, max_leagues = 3, 8
+    today = datetime.now(timezone.utc).date()
+    upcoming, leagues, errors = [], {}, []
+    for k in range(days):
+        resp, err = _api_call("fixtures", {"date": (today + timedelta(days=k)).isoformat()}, st_)
+        if err:
+            errors.append(err)
+            continue
+        for it in resp:
+            if it["fixture"]["status"]["short"] not in ("NS", "TBD"):
+                continue          # only matches that have not started
+            lg = it["league"]
+            L = leagues.setdefault(lg["id"], {"name": f"{lg.get('country') or 'World'} · {lg['name']}",
+                                              "season": lg["season"], "n": 0})
+            L["n"] += 1
+            utc, uk = _api_when(it["fixture"]["date"])
+            upcoming.append({"lid": lg["id"], "date": uk.date(), "time": uk.strftime("%H:%M"),
+                             "home": it["teams"]["home"]["name"], "away": it["teams"]["away"]["name"]})
+    if not upcoming:
+        raise RuntimeError("no upcoming fixtures from API-Football. " + (errors[0] if errors else ""))
+    chosen = sorted(leagues, key=lambda i: -leagues[i]["n"])[:max_leagues]
+    cache, names = {}, {}
+    for lid in chosen:
+        resp, err = _api_call("fixtures", {"league": lid, "season": leagues[lid]["season"],
+                                           "status": "FT-AET-PEN"}, st_)
+        if err:
+            errors.append(err)
+            continue
+        rows = []
+        for it in resp:
+            ft = (it.get("score") or {}).get("fulltime") or {}
+            g = it.get("goals") or {}
+            hg = ft.get("home") if ft.get("home") is not None else g.get("home")
+            ag = ft.get("away") if ft.get("away") is not None else g.get("away")
+            if hg is None or ag is None:
+                continue
+            utc, _ = _api_when(it["fixture"]["date"])
+            if utc.date() >= today:
+                continue          # keep today's results out so predictions never see the answer
+            row = {"date": datetime(utc.year, utc.month, utc.day), "home": it["teams"]["home"]["name"],
+                   "away": it["teams"]["away"]["name"], "hg": int(hg), "ag": int(ag)}
+            for key in p.STAT_COLS:
+                row[key] = None
+            rows.append(row)
+        if rows:
+            cache[f"A{lid}"] = rows
+            names[f"A{lid}"] = leagues[lid]["name"]
+    if not cache:
+        raise RuntimeError("no match history from API-Football. " + (errors[0] if errors else ""))
+    fixtures = [{"div": f"A{f['lid']}", "date": f["date"], "time": f["time"],
+                 "home": f["home"], "away": f["away"]} for f in upcoming if f"A{f['lid']}" in cache]
+    API_STATE.update(calls=st_["calls"], leagues=len(cache), fixtures=len(fixtures))
+    return cache, names, fixtures
+
+
 # ---------- prediction ----------
 @st.cache_resource(ttl=6 * 3600, show_spinner=False)
 def league_data():
-    """All leagues downloaded once and shared by every visitor (6 hours)."""
+    """All leagues loaded once and shared by every visitor (6 hours)."""
+    if secret("DATA_SOURCE").strip().lower() == "api":
+        try:
+            cache, names, fixtures = build_from_api()
+            p.LEAGUES.clear()
+            p.LEAGUES.update(names)
+            pk.load_fixtures = lambda: list(fixtures)
+            API_STATE.update(mode="api", note="")
+            return cache
+        except Exception as e:
+            API_STATE.update(mode="csv", note=f"API-Football not used ({e}). Using the free data.")
+    else:
+        API_STATE.update(mode="csv", note="")
+    p.LEAGUES.clear()
+    p.LEAGUES.update(_ORIG_LEAGUES)
+    pk.load_fixtures = _ORIG_FIXTURES
     cache = {}
     p.load_all(cache)
     if not any(cache.values()):
         # Raising means Streamlit does NOT cache this failure.
         raise RuntimeError("Could not download match data right now. Please try again.")
+    merge_live_results(cache)
     return cache
 
 
@@ -126,8 +392,8 @@ def get_all_matches():
     """Every upcoming fixture (next 7 days) in every league we have data for, with the
     model's prediction. Returns (result, error). Cached for 3 hours."""
     try:
-        fixtures = pk.load_fixtures()
         cache = league_data()
+        fixtures = pk.load_fixtures()
         today = datetime.now(timezone.utc).date()
         end = today + timedelta(days=7)
         per_div, out, skipped = {}, [], 0
@@ -331,7 +597,7 @@ def predictor_ui(has_access, key):
 
 
 # ---------- paywall screens ----------
-FREE_PICKS = 1   # how many matches free visitors see in full on the Top picks tab
+FREE_PICKS = 2   # how many matches free visitors see in full on the Top picks tab
 
 
 def picks_tab(has_access, key):
@@ -624,6 +890,12 @@ def owner_panel(key, admin_pw):
                          f"Valid for {label.split(' (')[0].lower()} from now. "
                          "Enter it on the site and tap Unlock.")
         st.divider()
+        if API_STATE["mode"] == "api":
+            st.info(f"Data source: API-Football · {API_STATE['leagues']} leagues · "
+                    f"{API_STATE['fixtures']} upcoming matches · {API_STATE['calls']} requests used "
+                    "in the last refresh.")
+        elif API_STATE["note"]:
+            st.warning(API_STATE["note"])
         st.markdown("**🧪 API coverage test (owner only)**")
         api_test_panel()
         if st.button("Log out"):
