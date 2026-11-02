@@ -7,7 +7,9 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
   PRICE_TEXT       = "UGX 2,000 per day"
   PAY_INSTRUCTIONS = "Send to MTN MoMo 07XXXXXXXX (Your Name)"
   WHATSAPP_NUMBER  = "2567XXXXXXXX"      (international format, no +)
-  FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (adds same-day results)
+  FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (same-day results + key players)
+
+Optional file beside this one: injuries.txt  (one line per team, see the file itself)
 """
 import contextlib
 import hashlib
@@ -21,7 +23,9 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -214,6 +218,85 @@ def merge_live_results(cache):
         return added
     except Exception:
         return 0
+
+
+# ---------- key players and injuries ----------
+@st.cache_data(ttl=12 * 3600, show_spinner=False)
+def _scorers():
+    """Top scorers per team from football-data.org (free key). Raises if nothing came
+    back, so a failure is not cached."""
+    token = secret("FOOTBALL_DATA_ORG_KEY")
+    out = {}
+    if token:
+        cache = league_data()
+        for code, div in FD_ORG.items():
+            rows = cache.get(div)
+            if not rows:
+                continue
+            try:
+                names = {r["home"] for r in rows} | {r["away"] for r in rows}
+                req = urllib.request.Request(
+                    f"https://api.football-data.org/v4/competitions/{code}/scorers?limit=80",
+                    headers={"X-Auth-Token": token})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                for s in data.get("scorers") or []:
+                    t = s.get("team") or {}
+                    team = match_team([t.get("name"), t.get("shortName")], names)
+                    pl = (s.get("player") or {}).get("name")
+                    if team and pl and s.get("goals") is not None:
+                        out.setdefault(team, []).append(
+                            (pl, int(s.get("goals") or 0), int(s.get("assists") or 0)))
+            except Exception:
+                continue
+    if not out:
+        raise RuntimeError("no scorers")
+    return out
+
+
+def key_players(team):
+    try:
+        return sorted(_scorers().get(team, []), key=lambda x: -x[1])[:3]
+    except Exception:
+        return []
+
+
+def injuries_for(team):
+    """Reads injuries.txt (beside this file). One line per team:  Arsenal: Saka (knee), Gabriel"""
+    try:
+        path = Path(__file__).parent / "injuries.txt"
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    me = _fold(team)
+    found = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line:
+            continue
+        name, players = line.split(":", 1)
+        n = _fold(name)
+        if n and (n == me or (len(n) >= 4 and (n in me or me in n))):
+            found += [x.strip() for x in players.split(",") if x.strip()]
+    return found
+
+
+def players_block(team):
+    inj = injuries_for(team)
+    inj_fold = " ".join(_fold(x) for x in inj)
+    kp = key_players(team)
+    st.markdown(f"**{team}**")
+    if kp:
+        for name, g, a in kp:
+            last = (_fold(name).split() or [""])[-1]
+            out = " 🚑 *injured*" if last and last in inj_fold else ""
+            st.markdown(f"⭐ {name} · {g} goals, {a} assists this season{out}")
+    else:
+        st.caption("Key players not available for this league.")
+    if inj:
+        st.markdown("🩹 **Injured / doubtful:** " + ", ".join(inj))
+    else:
+        st.caption("No injuries listed.")
 
 
 # ---------- prediction ----------
@@ -415,6 +498,12 @@ def show_result(data):
     c2.metric("Both teams score", f"{pr['btts']:.0%}")
     with st.expander("📊 Team stats (last 6 matches)", expanded=True):
         stats_table(data)
+    with st.expander("⭐ Key players & 🩹 injuries", expanded=True):
+        players_block(data["home"])
+        players_block(data["away"])
+        st.caption("Key players = the team's top scorers this season. Injuries are "
+                   "updated by hand, so check team news before kickoff. The "
+                   "prediction itself does not change for injuries.")
     with st.expander(f"{data['home']} - last 6 matches", expanded=True):
         team_card(data["home"], data["hm"], data["hs"], True)
     with st.expander(f"{data['away']} - last 6 matches", expanded=True):
@@ -458,6 +547,27 @@ def predictor_ui(has_access, key):
         show_locked(data, key)
 
 
+# ---------- Uganda time ----------
+UK_TZ, UG_TZ = ZoneInfo("Europe/London"), ZoneInfo("Africa/Kampala")
+
+
+def ug_when(d, t):
+    """Fixture date + UK clock time text -> (date, 'HH:MM') in Uganda time."""
+    try:
+        hh, mm = (int(x) for x in (t or "").split(":")[:2])
+        dt = datetime(d.year, d.month, d.day, hh, mm, tzinfo=UK_TZ).astimezone(UG_TZ)
+        return dt.date(), dt.strftime("%H:%M")
+    except Exception:
+        return d, (t or "")
+
+
+def with_ug(ms):
+    """Adds 'ugd' (Uganda date) and 'ugt' (Uganda time) to every match."""
+    for m in ms:
+        m["ugd"], m["ugt"] = ug_when(m["date"], m["time"])
+    return ms
+
+
 # ---------- paywall screens ----------
 FREE_PICKS = 1   # how many matches free visitors see in full on the Top picks tab
 
@@ -468,10 +578,11 @@ def picks_tab(has_access, key):
     if err:
         st.error(err)
         return
-    ms = res["matches"]
+    ms = sorted(with_ug([dict(m) for m in res["matches"]]),
+                key=lambda m: (m["ugd"], -m["picks"][0][1]))
     st.caption(f"Today · {len(ms)} high-confidence pick"
                f"{'' if len(ms) == 1 else 's'} from {res['analysed']} matches analysed. "
-               "Times are UK time.")
+               "Times are Uganda time (EAT).")
     # Free visitors get the FREE_PICKS strongest matches in full; the rest stay locked.
     best = sorted(range(len(ms)), key=lambda i: -ms[i]["picks"][0][1])
     free_ids = set() if has_access else set(best[:FREE_PICKS])
@@ -488,8 +599,8 @@ def picks_tab(has_access, key):
         st.markdown("### 📋 All top picks")
     day = None
     for i, m in enumerate(ms):
-        if m["date"] != day:
-            day = m["date"]
+        if m["ugd"] != day:
+            day = m["ugd"]
             st.markdown(f"<div class='day'>{day.strftime('%A, %d %B')}</div>",
                         unsafe_allow_html=True)
         if has_access or i in free_ids:
@@ -502,7 +613,7 @@ def picks_tab(has_access, key):
             pills = f"<span class='pill lock'>🔒 {n} pick{'' if n == 1 else 's'} locked</span>"
         st.markdown(
             f"<div class='pick'><div class='meta'>{html.escape(m['league'])} · "
-            f"{html.escape(m['time'])}</div><div class='vs'>{html.escape(m['home'])} vs "
+            f"{html.escape(m['ugt'])}</div><div class='vs'>{html.escape(m['home'])} vs "
             f"{html.escape(m['away'])}</div>{pills}</div>", unsafe_allow_html=True)
         if has_access or i in free_ids:
             pid = f"{m['home']}|{m['away']}"
@@ -532,18 +643,19 @@ def all_tab(has_access, key):
     if not ms:
         st.info("No upcoming fixtures found in the data right now. Check again later.")
         return
-    today = datetime.now(timezone.utc).date()
+    ms = sorted(with_ug([dict(m) for m in ms]), key=lambda m: (m["ugd"], m["ugt"] or "99:99", m["league"]))
+    today = datetime.now(UG_TZ).date()
     span = st.radio("Show matches", ["Today", "Tomorrow", "Next 3 days", "Next 7 days"],
                     horizontal=True, key="all_span")
     first, last = {"Today": (0, 1), "Tomorrow": (1, 2), "Next 3 days": (0, 3),
                    "Next 7 days": (0, 7)}[span]
-    ms = [m for m in ms if today + timedelta(days=first) <= m["date"] < today + timedelta(days=last)]
+    ms = [m for m in ms if today + timedelta(days=first) <= m["ugd"] < today + timedelta(days=last)]
     leagues = sorted({m["league"] for m in ms})
     pick = st.selectbox("League", ["All leagues"] + leagues, key="all_league")
     if pick != "All leagues":
         ms = [m for m in ms if m["league"] == pick]
     st.caption(f"{len(ms)} match{'' if len(ms) == 1 else 'es'} · "
-               f"{len({m['league'] for m in ms})} league(s). Times are UK time.")
+               f"{len({m['league'] for m in ms})} league(s). Times are Uganda time (EAT).")
     if not has_access:
         st.markdown("**🔒 Predictions for every league are for paying clients. "
                     "Unlock to see the predicted score, win chances, goals and "
@@ -554,11 +666,11 @@ def all_tab(has_access, key):
         return
     day = None
     for m in ms:
-        if m["date"] != day:
-            day = m["date"]
+        if m["ugd"] != day:
+            day = m["ugd"]
             st.markdown(f"<div class='day'>{day.strftime('%A, %d %B')}</div>",
                         unsafe_allow_html=True)
-        head = (f"<div class='meta'>{html.escape(m['league'])} · {html.escape(m['time'])}</div>"
+        head = (f"<div class='meta'>{html.escape(m['league'])} · {html.escape(m['ugt'])}</div>"
                 f"<div class='vs'>{html.escape(m['home'])} vs {html.escape(m['away'])}</div>")
         if has_access:
             pr = m["pr"]
