@@ -1,0 +1,4 @@
+# One line per team:  Team name: player (reason), player (reason)
+# Lines starting with # are ignored. Use the team name as the site shows it.
+Arsenal: Saka (knee), Gabriel (doubtful)
+Man United: Bruno Fernandes (suspended)
