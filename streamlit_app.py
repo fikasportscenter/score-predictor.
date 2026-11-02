@@ -9,7 +9,7 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
   WHATSAPP_NUMBER  = "2567XXXXXXXX"      (international format, no +)
   API_FOOTBALL_KEY = "your api-sports key"   (API test, and API data if DATA_SOURCE = "api")
   FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (adds same-day results)
-  DATA_SOURCE      = "api"            (optional: use API-Football for fixtures/results)
+  DATA_SOURCE      = "api"            (optional: use API-Football; falls back to free data + its free window)
   API_MAX_LEAGUES  = "8"              (optional: leagues fetched per refresh; raise on a paid plan)
   API_DAYS         = "3"              (optional: days of fixtures, 1-7)
   API_PER_MIN      = "10"             (optional: requests per minute allowed by your plan)
@@ -339,22 +339,86 @@ def build_from_api():
     return cache, names, fixtures
 
 
+# API-Football league id -> our league code (leagues we already have history for)
+API_DIV = {39: "E0", 40: "E1", 41: "E2", 42: "E3", 43: "EC", 140: "SP1", 141: "SP2",
+           135: "I1", 136: "I2", 78: "D1", 79: "D2", 61: "F1", 62: "F2", 88: "N1",
+           94: "P1", 144: "B1", 203: "T1", 197: "G1", 179: "SC0", 180: "SC1",
+           183: "SC2", 184: "SC3"}
+
+
+def hybrid_from_api(cache):
+    """Free-plan version: uses the 3 days the free plan allows (yesterday, today, tomorrow).
+    1) yesterday's finished matches are added to the leagues we already know;
+    2) upcoming matches of other leagues are returned as 'fixtures without history'.
+    Returns (results_added, extra_fixtures, extra_names, calls). Raises RuntimeError if
+    nothing could be fetched."""
+    st_ = {"last": 0.0, "calls": 0}
+    today = datetime.now(timezone.utc).date()
+    added, extra, names, errors, got = 0, [], {}, [], 0
+    team_names = {}
+    for k in (-1, 0, 1):
+        day = today + timedelta(days=k)
+        resp, err = _api_call("fixtures", {"date": day.isoformat()}, st_)
+        if err:
+            errors.append(err)
+            continue
+        got += 1
+        for it in resp:
+            lg, status = it["league"], it["fixture"]["status"]["short"]
+            div = API_DIV.get(lg["id"])
+            home, away = it["teams"]["home"]["name"], it["teams"]["away"]["name"]
+            if status in ("FT", "AET", "PEN"):
+                ft = (it.get("score") or {}).get("fulltime") or {}
+                g = it.get("goals") or {}
+                hg = ft.get("home") if ft.get("home") is not None else g.get("home")
+                ag = ft.get("away") if ft.get("away") is not None else g.get("away")
+                utc, _ = _api_when(it["fixture"]["date"])
+                rows = cache.get(div) if div else None
+                if not rows or hg is None or ag is None or utc.date() >= today:
+                    continue      # today's results stay out so predictions never see the answer
+                if div not in team_names:
+                    team_names[div] = {r["home"] for r in rows} | {r["away"] for r in rows}
+                h = match_team([home], team_names[div])
+                a = match_team([away], team_names[div])
+                d = datetime(utc.year, utc.month, utc.day)
+                if not h or not a or h == a or any(
+                        r["home"] == h and r["away"] == a and abs((r["date"] - d).days) <= 2
+                        for r in rows):
+                    continue
+                row = {"date": d, "home": h, "away": a, "hg": int(hg), "ag": int(ag)}
+                for key in p.STAT_COLS:
+                    row[key] = None
+                rows.append(row)
+                added += 1
+            elif status in ("NS", "TBD") and not div and day >= today:
+                utc, uk = _api_when(it["fixture"]["date"])
+                code = f"X{lg['id']}"
+                names[code] = f"{lg.get('country') or 'World'} · {lg['name']}"
+                cache.setdefault(code, [])       # empty on purpose: no history on the free plan
+                extra.append({"div": code, "date": uk.date(), "time": uk.strftime("%H:%M"),
+                              "home": home, "away": away})
+    if not got:
+        raise RuntimeError(errors[0] if errors else "no answer")
+    return added, extra, names, st_["calls"]
+
+
 # ---------- prediction ----------
 @st.cache_resource(ttl=6 * 3600, show_spinner=False)
 def league_data():
     """All leagues loaded once and shared by every visitor (6 hours)."""
-    if secret("DATA_SOURCE").strip().lower() == "api":
+    mode = secret("DATA_SOURCE").strip().lower()
+    reason = ""
+    if mode == "api":
         try:
             cache, names, fixtures = build_from_api()
             p.LEAGUES.clear()
             p.LEAGUES.update(names)
             pk.load_fixtures = lambda: list(fixtures)
-            API_STATE.update(mode="api", note="")
+            API_STATE.update(mode="api", note="", extra_names={})
             return cache
         except Exception as e:
-            API_STATE.update(mode="csv", note=f"API-Football not used ({e}). Using the free data.")
-    else:
-        API_STATE.update(mode="csv", note="")
+            reason = str(e)
+    # Free data (+ football-data.org live results), then the free API-Football window.
     p.LEAGUES.clear()
     p.LEAGUES.update(_ORIG_LEAGUES)
     pk.load_fixtures = _ORIG_FIXTURES
@@ -364,6 +428,25 @@ def league_data():
         # Raising means Streamlit does NOT cache this failure.
         raise RuntimeError("Could not download match data right now. Please try again.")
     merge_live_results(cache)
+    API_STATE.update(mode="csv", note="", extra_names={})
+    if mode in ("api", "hybrid") and secret("API_FOOTBALL_KEY"):
+        try:
+            added, extra, names, calls = hybrid_from_api(cache)
+
+            def with_extra():
+                try:
+                    base = _ORIG_FIXTURES()
+                except Exception:
+                    base = []
+                return base + list(extra)
+
+            pk.load_fixtures = with_extra
+            API_STATE.update(mode="hybrid", calls=calls, leagues=len(names), fixtures=len(extra),
+                             added=added, extra_names=names,
+                             note=("Full API mode needs a paid plan. " if "free plan" in reason.lower()
+                                   else f"Full API mode did not work ({reason}). " if reason else ""))
+        except Exception as e:
+            API_STATE.update(note=f"API-Football not used ({reason or e}). Using the free data.")
     return cache
 
 
@@ -408,7 +491,13 @@ def get_all_matches():
                 per_div[div] = (rows, names, ratings, avg, p.shot_ratings_from(rows))
             rows, names, ratings, avg, shot = per_div[div]
             if not rows:
-                skipped += 1
+                extra_name = (API_STATE.get("extra_names") or {}).get(div)
+                if extra_name:
+                    out.append({"date": f["date"], "time": f["time"], "div": div,
+                                "league": extra_name, "home": f["home"], "away": f["away"],
+                                "pr": None, "over15": None})
+                else:
+                    skipped += 1
                 continue
 
             def resolve(q):
@@ -678,8 +767,12 @@ def all_tab(has_access, key):
     ms = [m for m in ms if today + timedelta(days=first) <= m["date"] < today + timedelta(days=last)]
     leagues = sorted({m["league"] for m in ms})
     pick = st.selectbox("League", ["All leagues"] + leagues, key="all_league")
+    hidden = 0
     if pick != "All leagues":
         ms = [m for m in ms if m["league"] == pick]
+    else:
+        hidden = sum(m["pr"] is None for m in ms)
+        ms = [m for m in ms if m["pr"] is not None]
     st.caption(f"{len(ms)} match{'' if len(ms) == 1 else 'es'} · "
                f"{len({m['league'] for m in ms})} league(s). Times are UK time.")
     if not has_access:
@@ -698,7 +791,9 @@ def all_tab(has_access, key):
                         unsafe_allow_html=True)
         head = (f"<div class='meta'>{html.escape(m['league'])} · {html.escape(m['time'])}</div>"
                 f"<div class='vs'>{html.escape(m['home'])} vs {html.escape(m['away'])}</div>")
-        if has_access:
+        if m["pr"] is None:
+            pills = "<span class='pill lock'>No prediction: not enough match history yet</span>"
+        elif has_access:
             pr = m["pr"]
             (i, j), _ = pr["top"][0]
             pills = (f"<span class='pill hot'>Score {i}-{j}</span>"
@@ -712,7 +807,7 @@ def all_tab(has_access, key):
         else:
             pills = "<span class='pill lock'>🔒 Prediction locked</span>"
         st.markdown(f"<div class='pick'>{head}{pills}</div>", unsafe_allow_html=True)
-        if has_access:
+        if has_access and m["pr"] is not None:
             pid = f"{m['home']}|{m['away']}"
             opened = st.session_state.get("open_all") == pid
             if st.button("✖ Close analysis" if opened else "📈 See analysis",
@@ -726,6 +821,9 @@ def all_tab(has_access, key):
                     st.error(aerr)
                 else:
                     show_result(data)
+    if hidden:
+        st.caption(f"{hidden} more match(es) in other leagues have no prediction yet. "
+                   "Pick a league above to see its fixtures.")
     if res["skipped"]:
         st.caption(f"{res['skipped']} fixture(s) left out because there is not enough "
                    "recent data for one of the teams.")
@@ -894,6 +992,11 @@ def owner_panel(key, admin_pw):
             st.info(f"Data source: API-Football · {API_STATE['leagues']} leagues · "
                     f"{API_STATE['fixtures']} upcoming matches · {API_STATE['calls']} requests used "
                     "in the last refresh.")
+        elif API_STATE["mode"] == "hybrid":
+            st.info(API_STATE["note"] + f"Using the free data plus API-Football's free window: "
+                    f"{API_STATE.get('added', 0)} results from yesterday added, "
+                    f"{API_STATE['fixtures']} fixtures in {API_STATE['leagues']} other leagues, "
+                    f"{API_STATE['calls']} requests used in the last refresh.")
         elif API_STATE["note"]:
             st.warning(API_STATE["note"])
         st.markdown("**🧪 API coverage test (owner only)**")
