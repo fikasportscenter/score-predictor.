@@ -7,12 +7,7 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
   PRICE_TEXT       = "UGX 2,000 per day"
   PAY_INSTRUCTIONS = "Send to MTN MoMo 07XXXXXXXX (Your Name)"
   WHATSAPP_NUMBER  = "2567XXXXXXXX"      (international format, no +)
-  API_FOOTBALL_KEY = "your api-sports key"   (API test, and API data if DATA_SOURCE = "api")
   FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (adds same-day results)
-  DATA_SOURCE      = "api"            (optional: use API-Football; falls back to free data + its free window)
-  API_MAX_LEAGUES  = "8"              (optional: leagues fetched per refresh; raise on a paid plan)
-  API_DAYS         = "3"              (optional: days of fixtures, 1-7)
-  API_PER_MIN      = "10"             (optional: requests per minute allowed by your plan)
 """
 import contextlib
 import hashlib
@@ -27,7 +22,6 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
-from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -222,231 +216,16 @@ def merge_live_results(cache):
         return 0
 
 
-# ---------- API-Football data source (optional: DATA_SOURCE = "api") ----------
-@st.cache_resource(show_spinner=False)
-def _api_holder():
-    """Created once per running app (before any switching), so the original free-data
-    settings and the last API status survive Streamlit's re-runs."""
-    return {"state": {"mode": "csv", "note": "not loaded yet", "calls": 0, "leagues": 0,
-                      "fixtures": 0},
-            "leagues": dict(p.LEAGUES), "fixtures": pk.load_fixtures}
-
-
-_HOLDER = _api_holder()
-API_STATE = _HOLDER["state"]
-_ORIG_LEAGUES = _HOLDER["leagues"]
-_ORIG_FIXTURES = _HOLDER["fixtures"]
-_SKIP = {"PST", "CANC", "ABD", "AWD", "WO", "SUSP", "INT"}
-
-
-def _api_call(path, params, st_):
-    """One throttled call to API-Football. Returns (list_of_items, error_text)."""
-    akey = secret("API_FOOTBALL_KEY")
-    try:
-        per_min = max(1, int(secret("API_PER_MIN", "10") or 10))
-    except ValueError:
-        per_min = 10
-    url = "https://v3.football.api-sports.io/" + path + "?" + urllib.parse.urlencode(params)
-    for attempt in (1, 2):
-        wait = 60.0 / per_min - (time.time() - st_["last"])
-        if wait > 0:
-            time.sleep(wait)
-        st_["last"] = time.time()
-        st_["calls"] += 1
-        try:
-            req = urllib.request.Request(url, headers={"x-apisports-key": akey})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                data = json.loads(r.read().decode("utf-8"))
-        except Exception as e:
-            return None, str(e)
-        errs = data.get("errors")
-        if errs and not data.get("response"):
-            text = str(errs)
-            if attempt == 1 and "rate" in text.lower():
-                time.sleep(61)          # per-minute limit hit: wait a minute, try once more
-                continue
-            return None, text
-        return data.get("response") or [], None
-    return None, "rate limit"
-
-
-def _api_when(iso):
-    """API date text -> (UTC datetime, UK-time datetime)."""
-    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    return dt.astimezone(timezone.utc), dt.astimezone(ZoneInfo("Europe/London"))
-
-
-def build_from_api():
-    """Returns (league_cache, league_names, fixtures). Raises RuntimeError with a plain
-    reason when the API cannot be used (the caller then falls back to the free data)."""
-    st_ = {"last": 0.0, "calls": 0}
-    try:
-        days = max(1, min(7, int(secret("API_DAYS", "3") or 3)))
-        max_leagues = max(1, int(secret("API_MAX_LEAGUES", "8") or 8))
-    except ValueError:
-        days, max_leagues = 3, 8
-    today = datetime.now(timezone.utc).date()
-    upcoming, leagues, errors = [], {}, []
-    for k in range(days):
-        resp, err = _api_call("fixtures", {"date": (today + timedelta(days=k)).isoformat()}, st_)
-        if err:
-            errors.append(err)
-            continue
-        for it in resp:
-            if it["fixture"]["status"]["short"] not in ("NS", "TBD"):
-                continue          # only matches that have not started
-            lg = it["league"]
-            L = leagues.setdefault(lg["id"], {"name": f"{lg.get('country') or 'World'} · {lg['name']}",
-                                              "season": lg["season"], "n": 0})
-            L["n"] += 1
-            utc, uk = _api_when(it["fixture"]["date"])
-            upcoming.append({"lid": lg["id"], "date": uk.date(), "time": uk.strftime("%H:%M"),
-                             "home": it["teams"]["home"]["name"], "away": it["teams"]["away"]["name"]})
-    if not upcoming:
-        raise RuntimeError("no upcoming fixtures from API-Football. " + (errors[0] if errors else ""))
-    chosen = sorted(leagues, key=lambda i: -leagues[i]["n"])[:max_leagues]
-    cache, names = {}, {}
-    for lid in chosen:
-        resp, err = _api_call("fixtures", {"league": lid, "season": leagues[lid]["season"],
-                                           "status": "FT-AET-PEN"}, st_)
-        if err:
-            errors.append(err)
-            continue
-        rows = []
-        for it in resp:
-            ft = (it.get("score") or {}).get("fulltime") or {}
-            g = it.get("goals") or {}
-            hg = ft.get("home") if ft.get("home") is not None else g.get("home")
-            ag = ft.get("away") if ft.get("away") is not None else g.get("away")
-            if hg is None or ag is None:
-                continue
-            utc, _ = _api_when(it["fixture"]["date"])
-            if utc.date() >= today:
-                continue          # keep today's results out so predictions never see the answer
-            row = {"date": datetime(utc.year, utc.month, utc.day), "home": it["teams"]["home"]["name"],
-                   "away": it["teams"]["away"]["name"], "hg": int(hg), "ag": int(ag)}
-            for key in p.STAT_COLS:
-                row[key] = None
-            rows.append(row)
-        if rows:
-            cache[f"A{lid}"] = rows
-            names[f"A{lid}"] = leagues[lid]["name"]
-    if not cache:
-        raise RuntimeError("no match history from API-Football. " + (errors[0] if errors else ""))
-    fixtures = [{"div": f"A{f['lid']}", "date": f["date"], "time": f["time"],
-                 "home": f["home"], "away": f["away"]} for f in upcoming if f"A{f['lid']}" in cache]
-    API_STATE.update(calls=st_["calls"], leagues=len(cache), fixtures=len(fixtures))
-    return cache, names, fixtures
-
-
-# API-Football league id -> our league code (leagues we already have history for)
-API_DIV = {39: "E0", 40: "E1", 41: "E2", 42: "E3", 43: "EC", 140: "SP1", 141: "SP2",
-           135: "I1", 136: "I2", 78: "D1", 79: "D2", 61: "F1", 62: "F2", 88: "N1",
-           94: "P1", 144: "B1", 203: "T1", 197: "G1", 179: "SC0", 180: "SC1",
-           183: "SC2", 184: "SC3"}
-
-
-def hybrid_from_api(cache):
-    """Free-plan version: uses the 3 days the free plan allows (yesterday, today, tomorrow).
-    1) yesterday's finished matches are added to the leagues we already know;
-    2) upcoming matches of other leagues are returned as 'fixtures without history'.
-    Returns (results_added, extra_fixtures, extra_names, calls). Raises RuntimeError if
-    nothing could be fetched."""
-    st_ = {"last": 0.0, "calls": 0}
-    today = datetime.now(timezone.utc).date()
-    added, extra, names, errors, got = 0, [], {}, [], 0
-    team_names = {}
-    for k in (-1, 0, 1):
-        day = today + timedelta(days=k)
-        resp, err = _api_call("fixtures", {"date": day.isoformat()}, st_)
-        if err:
-            errors.append(err)
-            continue
-        got += 1
-        for it in resp:
-            lg, status = it["league"], it["fixture"]["status"]["short"]
-            div = API_DIV.get(lg["id"])
-            home, away = it["teams"]["home"]["name"], it["teams"]["away"]["name"]
-            if status in ("FT", "AET", "PEN"):
-                ft = (it.get("score") or {}).get("fulltime") or {}
-                g = it.get("goals") or {}
-                hg = ft.get("home") if ft.get("home") is not None else g.get("home")
-                ag = ft.get("away") if ft.get("away") is not None else g.get("away")
-                utc, _ = _api_when(it["fixture"]["date"])
-                rows = cache.get(div) if div else None
-                if not rows or hg is None or ag is None or utc.date() >= today:
-                    continue      # today's results stay out so predictions never see the answer
-                if div not in team_names:
-                    team_names[div] = {r["home"] for r in rows} | {r["away"] for r in rows}
-                h = match_team([home], team_names[div])
-                a = match_team([away], team_names[div])
-                d = datetime(utc.year, utc.month, utc.day)
-                if not h or not a or h == a or any(
-                        r["home"] == h and r["away"] == a and abs((r["date"] - d).days) <= 2
-                        for r in rows):
-                    continue
-                row = {"date": d, "home": h, "away": a, "hg": int(hg), "ag": int(ag)}
-                for key in p.STAT_COLS:
-                    row[key] = None
-                rows.append(row)
-                added += 1
-            elif status in ("NS", "TBD") and not div and day >= today:
-                utc, uk = _api_when(it["fixture"]["date"])
-                code = f"X{lg['id']}"
-                names[code] = f"{lg.get('country') or 'World'} · {lg['name']}"
-                cache.setdefault(code, [])       # empty on purpose: no history on the free plan
-                extra.append({"div": code, "date": uk.date(), "time": uk.strftime("%H:%M"),
-                              "home": home, "away": away})
-    if not got:
-        raise RuntimeError(errors[0] if errors else "no answer")
-    return added, extra, names, st_["calls"]
-
-
 # ---------- prediction ----------
 @st.cache_resource(ttl=6 * 3600, show_spinner=False)
 def league_data():
-    """All leagues loaded once and shared by every visitor (6 hours)."""
-    mode = secret("DATA_SOURCE").strip().lower()
-    reason = ""
-    if mode == "api":
-        try:
-            cache, names, fixtures = build_from_api()
-            p.LEAGUES.clear()
-            p.LEAGUES.update(names)
-            pk.load_fixtures = lambda: list(fixtures)
-            API_STATE.update(mode="api", note="", extra_names={})
-            return cache
-        except Exception as e:
-            reason = str(e)
-    # Free data (+ football-data.org live results), then the free API-Football window.
-    p.LEAGUES.clear()
-    p.LEAGUES.update(_ORIG_LEAGUES)
-    pk.load_fixtures = _ORIG_FIXTURES
+    """All leagues downloaded once and shared by every visitor (6 hours)."""
     cache = {}
     p.load_all(cache)
     if not any(cache.values()):
         # Raising means Streamlit does NOT cache this failure.
         raise RuntimeError("Could not download match data right now. Please try again.")
     merge_live_results(cache)
-    API_STATE.update(mode="csv", note="", extra_names={})
-    if mode in ("api", "hybrid") and secret("API_FOOTBALL_KEY"):
-        try:
-            added, extra, names, calls = hybrid_from_api(cache)
-
-            def with_extra():
-                try:
-                    base = _ORIG_FIXTURES()
-                except Exception:
-                    base = []
-                return base + list(extra)
-
-            pk.load_fixtures = with_extra
-            API_STATE.update(mode="hybrid", calls=calls, leagues=len(names), fixtures=len(extra),
-                             added=added, extra_names=names,
-                             note=("Full API mode needs a paid plan. " if "free plan" in reason.lower()
-                                   else f"Full API mode did not work ({reason}). " if reason else ""))
-        except Exception as e:
-            API_STATE.update(note=f"API-Football not used ({reason or e}). Using the free data.")
     return cache
 
 
@@ -475,8 +254,8 @@ def get_all_matches():
     """Every upcoming fixture (next 7 days) in every league we have data for, with the
     model's prediction. Returns (result, error). Cached for 3 hours."""
     try:
-        cache = league_data()
         fixtures = pk.load_fixtures()
+        cache = league_data()
         today = datetime.now(timezone.utc).date()
         end = today + timedelta(days=7)
         per_div, out, skipped = {}, [], 0
@@ -491,13 +270,7 @@ def get_all_matches():
                 per_div[div] = (rows, names, ratings, avg, p.shot_ratings_from(rows))
             rows, names, ratings, avg, shot = per_div[div]
             if not rows:
-                extra_name = (API_STATE.get("extra_names") or {}).get(div)
-                if extra_name:
-                    out.append({"date": f["date"], "time": f["time"], "div": div,
-                                "league": extra_name, "home": f["home"], "away": f["away"],
-                                "pr": None, "over15": None})
-                else:
-                    skipped += 1
+                skipped += 1
                 continue
 
             def resolve(q):
@@ -767,12 +540,8 @@ def all_tab(has_access, key):
     ms = [m for m in ms if today + timedelta(days=first) <= m["date"] < today + timedelta(days=last)]
     leagues = sorted({m["league"] for m in ms})
     pick = st.selectbox("League", ["All leagues"] + leagues, key="all_league")
-    hidden = 0
     if pick != "All leagues":
         ms = [m for m in ms if m["league"] == pick]
-    else:
-        hidden = sum(m["pr"] is None for m in ms)
-        ms = [m for m in ms if m["pr"] is not None]
     st.caption(f"{len(ms)} match{'' if len(ms) == 1 else 'es'} · "
                f"{len({m['league'] for m in ms})} league(s). Times are UK time.")
     if not has_access:
@@ -791,9 +560,7 @@ def all_tab(has_access, key):
                         unsafe_allow_html=True)
         head = (f"<div class='meta'>{html.escape(m['league'])} · {html.escape(m['time'])}</div>"
                 f"<div class='vs'>{html.escape(m['home'])} vs {html.escape(m['away'])}</div>")
-        if m["pr"] is None:
-            pills = "<span class='pill lock'>No prediction: not enough match history yet</span>"
-        elif has_access:
+        if has_access:
             pr = m["pr"]
             (i, j), _ = pr["top"][0]
             pills = (f"<span class='pill hot'>Score {i}-{j}</span>"
@@ -807,7 +574,7 @@ def all_tab(has_access, key):
         else:
             pills = "<span class='pill lock'>🔒 Prediction locked</span>"
         st.markdown(f"<div class='pick'>{head}{pills}</div>", unsafe_allow_html=True)
-        if has_access and m["pr"] is not None:
+        if has_access:
             pid = f"{m['home']}|{m['away']}"
             opened = st.session_state.get("open_all") == pid
             if st.button("✖ Close analysis" if opened else "📈 See analysis",
@@ -821,9 +588,6 @@ def all_tab(has_access, key):
                     st.error(aerr)
                 else:
                     show_result(data)
-    if hidden:
-        st.caption(f"{hidden} more match(es) in other leagues have no prediction yet. "
-                   "Pick a league above to see its fixtures.")
     if res["skipped"]:
         st.caption(f"{res['skipped']} fixture(s) left out because there is not enough "
                    "recent data for one of the teams.")
@@ -893,80 +657,6 @@ def payment_box(key, where):
             st.error(info)
 
 
-def api_test_panel():
-    """Owner only: checks what the API-Football key can see. Delete this whole function
-    (and the api_test_panel() call in owner_panel) if you do not need it."""
-    akey = secret("API_FOOTBALL_KEY")
-    if not akey:
-        st.warning("Add API_FOOTBALL_KEY in the app's Secrets to use this test.")
-        return
-
-    def call(path, **params):
-        url = "https://v3.football.api-sports.io/" + path
-        if params:
-            url += "?" + urllib.parse.urlencode(params)
-        req = urllib.request.Request(url, headers={"x-apisports-key": akey})
-        try:
-            with urllib.request.urlopen(req, timeout=25) as r:
-                return json.loads(r.read().decode("utf-8")), None
-        except Exception as e:
-            return None, str(e)
-
-    def tick(v):
-        return "✅" if v else "❌"
-
-    if st.button("Check my API account", key="api_status"):
-        data, err = call("status")
-        if err:
-            st.error(f"Could not reach the service: {err}")
-        else:
-            resp = data.get("response") or {}
-            if not resp:
-                st.error(f"The service did not accept the key: {data.get('errors')}")
-            else:
-                sub, req = resp.get("subscription", {}), resp.get("requests", {})
-                st.success(f"Key works. Plan: {sub.get('plan', '?')} · "
-                           f"requests today: {req.get('current', '?')} of {req.get('limit_day', '?')}")
-    st.caption("Is my league covered? Type a country (Uganda, Kenya, England) or a league name.")
-    term = st.text_input("Country or league", placeholder="Uganda", key="api_term")
-    if st.button("Search leagues", key="api_search"):
-        if len(term.strip()) < 3:
-            st.warning("Type at least 3 letters.")
-            return
-        found, errors = {}, []
-        for params in ({"country": term.strip()}, {"search": term.strip()}):
-            data, err = call("leagues", **params)
-            if err:
-                errors.append(err)
-                continue
-            if data.get("errors") and not data.get("response"):
-                errors.append(str(data["errors"]))
-            for item in data.get("response") or []:
-                found[item["league"]["id"]] = item
-        if not found:
-            st.info("Nothing found. " + (" ".join(errors) if errors else "Try another spelling."))
-            return
-        rows = ["| Country | League | Type | Season | Events | Lineups | Match stats | Player stats | Odds |",
-                "|---|---|---|---|---|---|---|---|---|"]
-        for item in list(found.values())[:40]:
-            seasons = item.get("seasons") or []
-            if not seasons:
-                continue
-            s = max(seasons, key=lambda x: x.get("year", 0))
-            cov = s.get("coverage") or {}
-            fx = cov.get("fixtures") or {}
-            rows.append(
-                f"| {html.escape(str(item['country'].get('name', '')))} "
-                f"| {html.escape(str(item['league'].get('name', '')))} "
-                f"| {item['league'].get('type', '')} | {s.get('year', '')} "
-                f"| {tick(fx.get('events'))} | {tick(fx.get('lineups'))} "
-                f"| {tick(fx.get('statistics_fixtures'))} | {tick(fx.get('statistics_players'))} "
-                f"| {tick(cov.get('odds'))} |")
-        st.markdown("\n".join(rows))
-        st.caption(f"{len(found)} competition(s) found. ✅ = the service says it provides "
-                   "it for that league. ❌ = not provided.")
-
-
 def owner_panel(key, admin_pw):
     with st.expander("Owner login"):
         if not st.session_state.get("admin_ok"):
@@ -987,20 +677,6 @@ def owner_panel(key, admin_pw):
                          f"Thank you! Your Score Predictor access code is:\n{code}\n"
                          f"Valid for {label.split(' (')[0].lower()} from now. "
                          "Enter it on the site and tap Unlock.")
-        st.divider()
-        if API_STATE["mode"] == "api":
-            st.info(f"Data source: API-Football · {API_STATE['leagues']} leagues · "
-                    f"{API_STATE['fixtures']} upcoming matches · {API_STATE['calls']} requests used "
-                    "in the last refresh.")
-        elif API_STATE["mode"] == "hybrid":
-            st.info(API_STATE["note"] + f"Using the free data plus API-Football's free window: "
-                    f"{API_STATE.get('added', 0)} results from yesterday added, "
-                    f"{API_STATE['fixtures']} fixtures in {API_STATE['leagues']} other leagues, "
-                    f"{API_STATE['calls']} requests used in the last refresh.")
-        elif API_STATE["note"]:
-            st.warning(API_STATE["note"])
-        st.markdown("**🧪 API coverage test (owner only)**")
-        api_test_panel()
         if st.button("Log out"):
             st.session_state["admin_ok"] = False
             st.rerun()
