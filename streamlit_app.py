@@ -7,7 +7,7 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
   PRICE_TEXT       = "UGX 2,000 per day"
   PAY_INSTRUCTIONS = "Send to MTN MoMo 07XXXXXXXX (Your Name)"
   WHATSAPP_NUMBER  = "2567XXXXXXXX"      (international format, no +)
-  FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (same-day results + key players)
+  FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (same-day results, key players, live scores)
 
 Optional file beside this one: injuries.txt  (one line per team, see the file itself)
 """
@@ -47,6 +47,14 @@ st.markdown("""
 .pill.hot {background:#d6f5df; color:#14532d;}
 .pill.lock {background:#e5e7eb; color:#555;}
 .pill.miss {background:#fde2e2; color:#7f1d1d;}
+.hdr {display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin:0 0 .6rem 0;}
+.hdr .ttl {font-size:2.2rem; font-weight:700; line-height:1.15; flex:1;}
+.live {min-width:150px; max-width:50%; border:1px solid rgba(128,128,128,.35); border-radius:12px; padding:8px 10px; font-size:.8rem; line-height:1.3;}
+.live .dot {color:#e11d48; font-weight:800;}
+.live .row {margin-top:5px;}
+.live .sc {font-weight:800;}
+.live .lg {opacity:.6; font-size:.72rem;}
+.live .none {opacity:.7;}
 .day {margin:18px 0 6px 0; font-weight:700; opacity:.65; text-transform:uppercase; font-size:.8rem; letter-spacing:.06em;}
 </style>
 """, unsafe_allow_html=True)
@@ -218,6 +226,65 @@ def merge_live_results(cache):
         return added
     except Exception:
         return 0
+
+
+# ---------- live scores (top of page) ----------
+@st.cache_data(ttl=60, show_spinner=False)
+def live_matches():
+    """Matches in play right now (football-data.org free key). Cached 60 seconds.
+    Never raises: returns [] on any problem."""
+    token = secret("FOOTBALL_DATA_ORG_KEY")
+    if not token:
+        return []
+    try:
+        req = urllib.request.Request(
+            "https://api.football-data.org/v4/matches?status=IN_PLAY,PAUSED",
+            headers={"X-Auth-Token": token})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        out = []
+        for m in data.get("matches") or []:
+            sc = m.get("score") or {}
+            ft = sc.get("fullTime") or {}
+            if ft.get("home") is None:
+                ft = sc.get("halfTime") or {}
+            h, a = m.get("homeTeam") or {}, m.get("awayTeam") or {}
+            hn, an = h.get("shortName") or h.get("name"), a.get("shortName") or a.get("name")
+            if not hn or not an:
+                continue
+            if m.get("status") == "PAUSED":
+                when = "HT"
+            elif m.get("minute") is not None:
+                when = f"{m['minute']}'"
+            else:
+                when = "LIVE"
+            out.append({"league": (m.get("competition") or {}).get("name", ""),
+                        "home": hn, "away": an, "when": when,
+                        "hg": ft.get("home") if ft.get("home") is not None else 0,
+                        "ag": ft.get("away") if ft.get("away") is not None else 0})
+        return out
+    except Exception:
+        return []
+
+
+def _live_header():
+    ms = live_matches()
+    if ms:
+        rows = "".join(
+            f"<div class='row'><span class='lg'>{html.escape(m['league'])}</span><br>"
+            f"<span class='dot'>{html.escape(str(m['when']))}</span> "
+            f"{html.escape(m['home'])} <span class='sc'>{m['hg']}-{m['ag']}</span> "
+            f"{html.escape(m['away'])}</div>" for m in ms[:3])
+        more = f"<div class='row lg'>+{len(ms) - 3} more live</div>" if len(ms) > 3 else ""
+        body = f"<div><span class='dot'>🔴 LIVE NOW</span></div>{rows}{more}"
+    else:
+        body = "<div class='none'>📡 Live scores<br>No match in play right now</div>"
+    st.markdown(f"<div class='hdr'><div class='ttl'>⚽ Score Predictor</div>"
+                f"<div class='live'>{body}</div></div>", unsafe_allow_html=True)
+
+
+_frag = getattr(st, "fragment", None)   # refreshes just this box every minute
+live_header = _frag(run_every="60s")(_live_header) if _frag else _live_header
 
 
 # ---------- key players and injuries ----------
@@ -812,7 +879,7 @@ if not has_access:
         st.warning(info)
         st.session_state.pop("code", None)
 
-st.title("⚽ Score Predictor")
+live_header()
 tab_picks, tab_all, tab_results, tab_pred = st.tabs(
     ["🔥 Top picks", "🌍 All leagues", "📊 Results", "🔍 Predict a match"])
 with tab_picks:
