@@ -574,9 +574,12 @@ def show_result(data):
     for label, val in ((f"{data['home']} win", pr["home"]), ("Draw", pr["draw"]),
                        (f"{data['away']} win", pr["away"])):
         st.progress(min(max(val, 0.0), 1.0), text=f"{label}: {val:.0%}")
-    c1, c2 = st.columns(2)
-    c1.metric("Over 2.5 goals", f"{pr['over25']:.0%}")
-    c2.metric("Both teams score", f"{pr['btts']:.0%}")
+    total = pr["xg_home"] + pr["xg_away"]
+    over15 = 1 - math.exp(-total) * (1 + total)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Over 1.5 goals", f"{over15:.0%}")
+    c2.metric("Over 2.5 goals", f"{pr['over25']:.0%}")
+    c3.metric("Both teams score", f"{pr['btts']:.0%}")
     with st.expander("📊 Team stats (last 6 matches)", expanded=True):
         stats_table(data)
     with st.expander("⭐ Key players & 🩹 injuries", expanded=True):
