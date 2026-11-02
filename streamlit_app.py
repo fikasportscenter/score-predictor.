@@ -7,7 +7,7 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
   PRICE_TEXT       = "UGX 2,000 per day"
   PAY_INSTRUCTIONS = "Send to MTN MoMo 07XXXXXXXX (Your Name)"
   WHATSAPP_NUMBER  = "2567XXXXXXXX"      (international format, no +)
-  FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (same-day results, key players, live scores)
+  FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (same-day results + key players)
 
 Optional file beside this one: injuries.txt  (one line per team, see the file itself)
 """
@@ -28,6 +28,7 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 import picks as pk
 import predictor_nokey as p
@@ -47,19 +48,91 @@ st.markdown("""
 .pill.hot {background:#d6f5df; color:#14532d;}
 .pill.lock {background:#e5e7eb; color:#555;}
 .pill.miss {background:#fde2e2; color:#7f1d1d;}
-.hdr {display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin:0 0 .6rem 0;}
-.hdr .ttl {font-size:2.2rem; font-weight:700; line-height:1.15; flex:1;}
-.live {min-width:150px; max-width:50%; border:1px solid rgba(128,128,128,.35); border-radius:12px; padding:8px 10px; font-size:.8rem; line-height:1.3;}
-.live .dot {color:#e11d48; font-weight:800;}
-.live .row {margin-top:5px;}
-.live .sc {font-weight:800;}
-.live .lg {opacity:.6; font-size:.72rem;}
-.live .none {opacity:.7;}
 .day {margin:18px 0 6px 0; font-weight:700; opacity:.65; text-transform:uppercase; font-size:.8rem; letter-spacing:.06em;}
+/* keep the title and the virtual match side by side, even on a phone */
+div[data-testid="stHorizontalBlock"]:has(iframe) {flex-wrap:nowrap !important; gap:.5rem;}
+div[data-testid="stHorizontalBlock"]:has(iframe) > div[data-testid="stColumn"] {min-width:0 !important;}
 </style>
 """, unsafe_allow_html=True)
 
 PASSES = {"Daily (24 hours)": 24, "Weekly (7 days)": 24 * 7, "Monthly (30 days)": 24 * 30}
+
+# ---------- virtual live match (simulation, shown beside the title) ----------
+VIRTUAL_HTML = """
+<style>
+ body{margin:0;font-family:sans-serif}
+ #w{background:#0b3d1e;border-radius:12px;padding:6px;color:#fff;text-align:center}
+ #hd{font:700 10px sans-serif;letter-spacing:.08em;color:#ffd43b}
+ #sc{font:800 14px sans-serif;margin:2px 0}
+ canvas{width:100%;height:170px;display:block;border-radius:8px}
+</style>
+<div id="w">
+ <div id="hd">🔴 LIVE · VIRTUAL MATCH</div>
+ <div id="sc"></div>
+ <canvas id="c"></canvas>
+</div>
+<script>
+const TEAMS=[["ARS","#e03131"],["CHE","#1c7ed6"],["MCI","#74c0fc"],["LIV","#c92a2a"],
+ ["BAR","#7048e8"],["RMA","#f1f3f5"],["INT","#1864ab"],["BAY","#fa5252"]];
+const c=document.getElementById('c'),g=c.getContext('2d'),sc=document.getElementById('sc');
+function fit(){c.width=c.clientWidth*2;c.height=c.clientHeight*2}
+fit();
+const base=[[.5,.93],[.25,.74],[.75,.74],[.35,.52],[.65,.52]];
+let A,B,score,min,ball,tgt,poss,pl,pause,pause2=0;
+function start(){
+  const i=Math.floor(Math.random()*8);let j;do{j=Math.floor(Math.random()*8)}while(j==i);
+  A=TEAMS[i];B=TEAMS[j];score=[0,0];min=0;poss=0;pause=0;
+  pl=[base.map(p=>({x:p[0],y:p[1],hx:p[0],hy:p[1]})),
+      base.map(p=>({x:p[0],y:1-p[1],hx:p[0],hy:1-p[1]}))];
+  ball={x:.5,y:.5};tgt={x:.5,y:.5,shot:false};
+  draw();
+}
+function newTarget(){
+  const atkY=poss==0?0:1;
+  if(Math.random()<.14){tgt={x:.5+(Math.random()-.5)*.2,y:atkY,shot:true}}
+  else{const k=1+Math.floor(Math.random()*4),p=pl[poss][k];tgt={x:p.x,y:p.y,shot:false}}
+}
+function step(){
+  if(pause>0){pause--;return}
+  const dx=tgt.x-ball.x,dy=tgt.y-ball.y,d=Math.hypot(dx,dy),s=tgt.shot?.05:.03;
+  if(d<s){
+    ball.x=tgt.x;ball.y=tgt.y;
+    if(tgt.shot){
+      if(Math.random()<.4){score[poss]++;pause=20;
+        ball={x:.5,y:.5};poss=1-poss;
+      }else{poss=1-poss;ball.y=poss==0?.85:.15}
+    }else if(Math.random()<.2)poss=1-poss;
+    newTarget();
+  }else{ball.x+=dx/d*s;ball.y+=dy/d*s}
+  pl.forEach((t,ti)=>t.forEach(p=>{
+    const pull=(ti==poss?.35:.2);
+    p.x+=((p.hx+(ball.x-p.hx)*pull)-p.x)*.08+(Math.random()-.5)*.006;
+    p.y+=((p.hy+(ball.y-p.hy)*pull)-p.y)*.08+(Math.random()-.5)*.006;
+  }));
+}
+function draw(){
+  const W=c.width,H=c.height;
+  g.fillStyle='#2f9e44';g.fillRect(0,0,W,H);
+  g.strokeStyle='rgba(255,255,255,.7)';g.lineWidth=2;
+  g.strokeRect(6,6,W-12,H-12);
+  g.beginPath();g.moveTo(6,H/2);g.lineTo(W-6,H/2);g.stroke();
+  g.beginPath();g.arc(W/2,H/2,H*.1,0,7);g.stroke();
+  g.strokeRect(W*.25,6,W*.5,H*.14);g.strokeRect(W*.25,H*.86-6,W*.5,H*.14);
+  [[A[1],0],[B[1],1]].forEach(([col,ti])=>{
+    g.fillStyle=col;
+    pl[ti].forEach(p=>{g.beginPath();g.arc(p.x*W,p.y*H,7,0,7);g.fill();
+      g.strokeStyle='#fff';g.stroke()});
+  });
+  g.fillStyle='#fff';g.beginPath();g.arc(ball.x*W,ball.y*H,5,0,7);g.fill();
+  g.strokeStyle='#000';g.lineWidth=1.5;g.stroke();
+  sc.textContent=A[0]+' '+score[0]+' - '+score[1]+' '+B[0]+'  ·  '+
+    (min>=90?'FT':Math.floor(min)+"'");
+}
+setInterval(()=>{step();draw()},50);
+setInterval(()=>{if(min<90)min+=1;else if(++pause2>5){pause2=0;start()}},700);
+start();
+</script>
+"""
 
 
 # ---------- access codes ----------
@@ -226,65 +299,6 @@ def merge_live_results(cache):
         return added
     except Exception:
         return 0
-
-
-# ---------- live scores (top of page) ----------
-@st.cache_data(ttl=60, show_spinner=False)
-def live_matches():
-    """Matches in play right now (football-data.org free key). Cached 60 seconds.
-    Never raises: returns [] on any problem."""
-    token = secret("FOOTBALL_DATA_ORG_KEY")
-    if not token:
-        return []
-    try:
-        req = urllib.request.Request(
-            "https://api.football-data.org/v4/matches?status=IN_PLAY,PAUSED",
-            headers={"X-Auth-Token": token})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        out = []
-        for m in data.get("matches") or []:
-            sc = m.get("score") or {}
-            ft = sc.get("fullTime") or {}
-            if ft.get("home") is None:
-                ft = sc.get("halfTime") or {}
-            h, a = m.get("homeTeam") or {}, m.get("awayTeam") or {}
-            hn, an = h.get("shortName") or h.get("name"), a.get("shortName") or a.get("name")
-            if not hn or not an:
-                continue
-            if m.get("status") == "PAUSED":
-                when = "HT"
-            elif m.get("minute") is not None:
-                when = f"{m['minute']}'"
-            else:
-                when = "LIVE"
-            out.append({"league": (m.get("competition") or {}).get("name", ""),
-                        "home": hn, "away": an, "when": when,
-                        "hg": ft.get("home") if ft.get("home") is not None else 0,
-                        "ag": ft.get("away") if ft.get("away") is not None else 0})
-        return out
-    except Exception:
-        return []
-
-
-def _live_header():
-    ms = live_matches()
-    if ms:
-        rows = "".join(
-            f"<div class='row'><span class='lg'>{html.escape(m['league'])}</span><br>"
-            f"<span class='dot'>{html.escape(str(m['when']))}</span> "
-            f"{html.escape(m['home'])} <span class='sc'>{m['hg']}-{m['ag']}</span> "
-            f"{html.escape(m['away'])}</div>" for m in ms[:3])
-        more = f"<div class='row lg'>+{len(ms) - 3} more live</div>" if len(ms) > 3 else ""
-        body = f"<div><span class='dot'>🔴 LIVE NOW</span></div>{rows}{more}"
-    else:
-        body = "<div class='none'>📡 Live scores<br>No match in play right now</div>"
-    st.markdown(f"<div class='hdr'><div class='ttl'>⚽ Score Predictor</div>"
-                f"<div class='live'>{body}</div></div>", unsafe_allow_html=True)
-
-
-_frag = getattr(st, "fragment", None)   # refreshes just this box every minute
-live_header = _frag(run_every="60s")(_live_header) if _frag else _live_header
 
 
 # ---------- key players and injuries ----------
@@ -879,7 +893,13 @@ if not has_access:
         st.warning(info)
         st.session_state.pop("code", None)
 
-live_header()
+# Title on the left, virtual live match on the right
+title_col, match_col = st.columns([3, 2])
+with title_col:
+    st.markdown("## ⚽ Score Predictor")
+with match_col:
+    components.html(VIRTUAL_HTML, height=235)
+
 tab_picks, tab_all, tab_results, tab_pred = st.tabs(
     ["🔥 Top picks", "🌍 All leagues", "📊 Results", "🔍 Predict a match"])
 with tab_picks:
