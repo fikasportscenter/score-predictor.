@@ -1285,14 +1285,27 @@ FREE_PICKS = 1   # how many matches free visitors see in full on the Top picks t
 def picks_tab(has_access, key):
     with st.spinner("Loading today's picks (first time can take ~30 seconds)..."):
         res, err = get_picks(1)
+        look = 1
+        if not err and not res["matches"]:
+            # Nothing in our leagues today (e.g. a Champions League night):
+            # show the next days that do have matches instead of an empty page.
+            for d in (3, 7):
+                r2, e2 = get_picks(d)
+                if not e2 and r2["matches"]:
+                    res, look = r2, d
+                    break
     if err:
         st.error(err)
         return
     ms = sorted(with_ug([dict(m) for m in res["matches"]]),
                 key=lambda m: (m["ugd"], -m["picks"][0][1]))
-    st.caption(f"Today · {len(ms)} high-confidence pick"
+    when = "Today" if look == 1 else f"Next {look} days"
+    st.caption(f"{when} · {len(ms)} high-confidence pick"
                f"{'' if len(ms) == 1 else 's'} from {res['analysed']} matches analysed. "
                "Times are Uganda time (EAT).")
+    if look > 1:
+        st.info("No matches in our leagues today, so here are the next days' picks. "
+                "Our data covers domestic leagues, not Champions League or Europa League.")
     # Free visitors get the FREE_PICKS strongest matches in full; the rest stay locked.
     best = sorted(range(len(ms)), key=lambda i: -ms[i]["picks"][0][1])
     free_ids = set() if has_access else set(best[:FREE_PICKS])
