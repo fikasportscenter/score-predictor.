@@ -49,6 +49,19 @@ st.markdown("""
 .pill.lock {background:#e5e7eb; color:#555;}
 .pill.miss {background:#fde2e2; color:#7f1d1d;}
 .day {margin:18px 0 6px 0; font-weight:700; opacity:.65; text-transform:uppercase; font-size:.8rem; letter-spacing:.06em;}
+/* virtual match runs full screen behind the page */
+iframe[srcdoc] {position:fixed !important; top:0; left:0; width:100vw !important; height:100vh !important;
+  height:100dvh !important; border:0; z-index:0; pointer-events:none;}
+div:has(> iframe[srcdoc]) {height:0 !important; min-height:0 !important; margin:0 !important; padding:0 !important;}
+body {background:#050a1c;}
+.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"], [data-testid="stHeader"] {background:transparent !important;}
+.hero {position:relative; z-index:1; min-height:32vh; display:flex; flex-direction:column; justify-content:flex-end;
+  padding-bottom:.7rem; color:#fff; text-shadow:0 2px 14px rgba(0,0,0,.9);}
+.hero-t {font-size:2.1rem; font-weight:800; line-height:1.1;}
+.hero-s {opacity:.85; font-size:.9rem;}
+.st-key-sheet {position:relative; z-index:1; background:rgba(255,255,255,.94); border-radius:22px 22px 0 0;
+  padding:1rem 1rem 2rem 1rem; box-shadow:0 -6px 24px rgba(0,0,0,.4);}
+@media (prefers-color-scheme: dark) {.st-key-sheet {background:rgba(14,17,23,.92);}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -57,9 +70,8 @@ PASSES = {"Daily (24 hours)": 24, "Weekly (7 days)": 24 * 7, "Monthly (30 days)"
 # ---------- virtual live match (simulation, shown beside the title) ----------
 VIRTUAL_HTML_2D = """
 <style>
- html,body{margin:0;background:transparent;overflow:hidden}
- #w{max-width:520px;margin:0 auto;border-radius:14px;overflow:hidden;background:#050a1c;
-    box-shadow:0 4px 18px rgba(0,0,0,.35)}
+ html,body{margin:0;background:#050a1c;overflow:hidden}
+ #w{position:fixed;top:0;left:0;width:100%;overflow:hidden;background:#050a1c}
  canvas{width:100%;aspect-ratio:16/9;display:block}
 </style>
 <div id="w"><canvas id="c"></canvas></div>
@@ -78,7 +90,7 @@ let A,B,score,min,ft,ftWait,pl,ref,ball,poss,st,hold,carryT,fl,celT,cmT,cmTxt,sc
 
 function fit(){
   W=c.width=Math.round(c.clientWidth*DPR);H=c.height=Math.round(c.clientHeight*DPR);buildStands();
-  try{window.frameElement.style.height=(document.getElementById('w').offsetHeight+2)+'px'}catch(e){}
+  
 }
 function buildStands(){
   stands=document.createElement('canvas');stands.width=W*2;stands.height=Math.round(H*.31);
@@ -343,10 +355,9 @@ fit();addEventListener('resize',()=>{fit()});start();
 VIRTUAL_HTML_3D_TEMPLATE = """
 <style>
  html,body{margin:0;background:transparent;overflow:hidden}
- #w{position:relative;max-width:520px;margin:0 auto;border-radius:14px;overflow:hidden;background:#050a1c;
-    --u:5px;font-family:'Arial Black',Impact,Arial,sans-serif;font-style:italic;color:#fff;
-    box-shadow:0 4px 18px rgba(0,0,0,.35)}
- canvas{width:100%;aspect-ratio:16/9;display:block}
+ #w{position:fixed;inset:0;overflow:hidden;background:#050a1c;
+    --u:5px;font-family:'Arial Black',Impact,Arial,sans-serif;font-style:italic;color:#fff}
+ canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
  #sb{position:absolute;left:2.5%;top:4%;display:flex;gap:calc(var(--u)*.8)}
  .box{background:rgba(8,12,28,.88);border-radius:calc(var(--u)*1);padding:calc(var(--u)*.8) calc(var(--u)*1.5);
       display:flex;align-items:center;gap:calc(var(--u)*1.1);font-size:calc(var(--u)*3.3);line-height:1}
@@ -386,7 +397,7 @@ const renderer=new THREE.WebGLRenderer({canvas:canvas,antialias:true,powerPrefer
 if(!renderer.getContext()){fallback();return}
 const L=84,WD=44,GW=9,GH=4.6,SC=1.9,PHM=3.4,SP=.0042;
 const WX=x=>(x-.5)*L,WZ=y=>(y-.5)*WD;
-renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,1.5));
 renderer.outputEncoding=THREE.sRGBEncoding;
 renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
 renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.05;
@@ -661,8 +672,8 @@ function step(){
 }
 function camStep(){
   let tp,tl,k=.07;
-  if(st==='cel'&&scorer){const sx=WX(scorer.p.x),sz=WZ(scorer.p.y);tp=[sx*.92,6.5,sz+13];tl=[sx,1.6,sz];k=.045}
-  else{const bx=Math.max(-27,Math.min(27,WX(ball.x)));tp=[bx,14,27];tl=[bx,0,1]}
+  if(st==='cel'&&scorer){const sx=WX(scorer.p.x),sz=WZ(scorer.p.y);tp=[sx*.92,6.5*K,sz+13*K];tl=[sx,1.6,sz];k=.045}
+  else{const bx=Math.max(-27,Math.min(27,WX(ball.x)));tp=[bx,14*K,27*K];tl=[bx,0,1]}
   for(let i=0;i<3;i++){cp[i]+=(tp[i]-cp[i])*k;cl[i]+=(tl[i]-cl[i])*k}
 }
 // ---------- render sync ----------
@@ -707,11 +718,12 @@ function hud(){
   if(cmT>0){$('cm').textContent=cmTxt;$('cm').style.opacity=Math.min(1,cmT/20)}else $('cm').style.opacity=0;
 }
 // ---------- sizing & loop ----------
+let K=1;
 function fit(){
-  const w=wrap.clientWidth,h=Math.round(w*9/16);
+  const w=wrap.clientWidth||window.innerWidth,h=wrap.clientHeight||window.innerHeight,portrait=w/h<1;
+  K=portrait?1.5:1;camera.fov=portrait?55:40;
   renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix();
-  wrap.style.setProperty('--u',(w/100)+'px');
-  try{window.frameElement.style.height=(wrap.offsetHeight+2)+'px'}catch(e){}
+  wrap.style.setProperty('--u',(Math.min(w,520)/100)+'px');
 }
 fit();addEventListener('resize',fit);
 start();
@@ -1490,27 +1502,37 @@ if not key or not admin_pw:
     st.stop()
 
 has_access = bool(st.session_state.get("admin_ok"))
+notice = None
 if not has_access:
     code = st.session_state.get("code") or st.query_params.get("code", "")
     ok, info = check_code(key, code)
     if ok:
         has_access = True
-        st.caption(f"✅ Access active - {time_left_text(info)} left")
+        notice = ("caption", f"✅ Access active - {time_left_text(info)} left")
     elif code:
-        st.warning(info)
+        notice = ("warning", info)
         st.session_state.pop("code", None)
 
-st.title("⚽ Score Predictor")
-components.html(VIRTUAL_HTML, height=320)
+# Virtual match plays full screen behind the whole page (see CSS at the top)
+components.html(VIRTUAL_HTML, height=1)
+st.markdown("<div class='hero'><div class='hero-t'>⚽ Score Predictor</div>"
+            "<div class='hero-s'>🔴 Live virtual match</div></div>", unsafe_allow_html=True)
 
-tab_picks, tab_all, tab_results, tab_pred = st.tabs(
-    ["🔥 Top picks", "🌍 All leagues", "📊 Results", "🔍 Predict a match"])
-with tab_picks:
-    picks_tab(has_access, key)
-with tab_all:
-    all_tab(has_access, key)
-with tab_results:
-    results_tab()
-with tab_pred:
-    predictor_ui(has_access, key)
-owner_panel(key, admin_pw)
+try:
+    sheet = st.container(key="sheet")
+except TypeError:            # older Streamlit without container keys
+    sheet = st.container()
+with sheet:
+    if notice:
+        getattr(st, notice[0])(notice[1])
+    tab_picks, tab_all, tab_results, tab_pred = st.tabs(
+        ["🔥 Top picks", "🌍 All leagues", "📊 Results", "🔍 Predict a match"])
+    with tab_picks:
+        picks_tab(has_access, key)
+    with tab_all:
+        all_tab(has_access, key)
+    with tab_results:
+        results_tab()
+    with tab_pred:
+        predictor_ui(has_access, key)
+    owner_panel(key, admin_pw)
