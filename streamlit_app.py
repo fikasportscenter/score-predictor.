@@ -23,6 +23,7 @@ import unicodedata
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
 from pathlib import Path
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -1278,6 +1279,109 @@ def with_ug(ms):
     return ms
 
 
+# ---------- manual matches (added by the owner) ----------
+MANUAL_FILE = Path(__file__).parent / "manual_matches.json"
+
+
+def load_manual():
+    try:
+        data = json.loads(MANUAL_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_manual(items):
+    try:
+        MANUAL_FILE.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def markets_from_pred(pr):
+    """Turn a match prediction into pick markets: all that reach 70%, else the best two."""
+    total = pr["xg_home"] + pr["xg_away"]
+    o15 = 1 - math.exp(-total) * (1 + total)
+    cand = [("Home win", pr["home"]), ("Away win", pr["away"]),
+            ("Over 1.5 goals", o15), ("Over 2.5 goals", pr["over25"]),
+            ("Under 2.5 goals", 1 - pr["over25"]),
+            ("Both teams score: Yes", pr["btts"]), ("Both teams score: No", 1 - pr["btts"]),
+            ("Home or draw", pr["home"] + pr["draw"]), ("Away or draw", pr["away"] + pr["draw"])]
+    cand.sort(key=lambda x: -x[1])
+    return [c for c in cand if c[1] >= 0.70][:4] or cand[:2]
+
+
+def manual_picks():
+    """Owner-added matches from today on, shaped like the normal Top picks entries."""
+    out = []
+    today = datetime.now(UG_TZ).date()
+    for it in load_manual():
+        try:
+            d = datetime.strptime(it["date"], "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if d < today:
+            continue
+        data, err = compute(it["home"], it["away"])
+        if err or not data:
+            continue
+        out.append({"home": data["home"], "away": data["away"],
+                    "league": it.get("league") or "Featured match",
+                    "ugd": d, "ugt": it.get("time") or "",
+                    "picks": markets_from_pred(data["pred"])})
+    return out
+
+
+def manual_admin():
+    st.markdown("**📝 Add a match manually**")
+    st.caption("Use this when Top picks has no games. Type the two teams the same way "
+               "as in the Predict a match tab. The model works out the picks. "
+               "Time is Uganda time.")
+    home = st.text_input("Home team", key="mm_home")
+    away = st.text_input("Away team", key="mm_away")
+    league = st.text_input("Competition (optional)", key="mm_league",
+                           placeholder="Champions League")
+    c1, c2 = st.columns(2)
+    d = c1.date_input("Date", value=datetime.now(UG_TZ).date(), key="mm_date")
+    t = c2.time_input("Kick-off", value=dtime(20, 45), key="mm_time")
+    if st.button("Add match", key="mm_add", use_container_width=True):
+        if not home.strip() or not away.strip():
+            st.warning("Type both team names.")
+        else:
+            data, err = compute(home.strip(), away.strip())
+            if err or not data:
+                st.error(err or "Could not find those teams.")
+            else:
+                items = load_manual()
+                entry = {"id": hashlib.md5(f"{data['home']}{data['away']}{d}{t}".encode()).hexdigest()[:8],
+                         "home": data["home"], "away": data["away"],
+                         "league": league.strip(), "date": d.isoformat(),
+                         "time": t.strftime("%H:%M")}
+                if any(x.get("id") == entry["id"] for x in items):
+                    st.info("That match is already added.")
+                else:
+                    items.append(entry)
+                    if save_manual(items):
+                        st.success(f"Added {data['home']} vs {data['away']}. "
+                                   "It now shows in Top picks.")
+                    else:
+                        st.error("Could not save the match on the server.")
+    items = load_manual()
+    if items:
+        st.markdown("**Matches you added**")
+        for x in sorted(items, key=lambda x: (x.get("date", ""), x.get("time", ""))):
+            c1, c2 = st.columns([4, 1])
+            c1.markdown(f"{x['home']} vs {x['away']}  \n"
+                        f"<small>{x.get('date', '')} {x.get('time', '')}</small>",
+                        unsafe_allow_html=True)
+            if c2.button("🗑", key=f"mm_del_{x['id']}"):
+                save_manual([y for y in items if y.get("id") != x["id"]])
+                st.rerun()
+        st.caption("Past matches are hidden automatically. Saved on the server, so they "
+                   "may be cleared if the app is rebooted or redeployed.")
+
+
 # ---------- paywall screens ----------
 FREE_PICKS = 1   # how many matches free visitors see in full on the Top picks tab
 
@@ -1286,7 +1390,8 @@ def picks_tab(has_access, key):
     with st.spinner("Loading today's picks (first time can take ~30 seconds)..."):
         res, err = get_picks(1)
         look = 1
-        if not err and not res["matches"]:
+        manual = manual_picks()
+        if not err and not res["matches"] and not manual:
             # Nothing in our leagues today (e.g. a Champions League night):
             # show the next days that do have matches instead of an empty page.
             for d in (3, 7):
@@ -1297,11 +1402,11 @@ def picks_tab(has_access, key):
     if err:
         st.error(err)
         return
-    ms = sorted(with_ug([dict(m) for m in res["matches"]]),
+    ms = sorted(with_ug([dict(m) for m in res["matches"]]) + manual,
                 key=lambda m: (m["ugd"], -m["picks"][0][1]))
     when = "Today" if look == 1 else f"Next {look} days"
     st.caption(f"{when} · {len(ms)} high-confidence pick"
-               f"{'' if len(ms) == 1 else 's'} from {res['analysed']} matches analysed. "
+               f"{'' if len(ms) == 1 else 's'} from {res['analysed'] + len(manual)} matches analysed. "
                "Times are Uganda time (EAT).")
     if look > 1:
         st.info("No matches in our leagues today, so here are the next days' picks. "
@@ -1512,6 +1617,9 @@ def owner_panel(key, admin_pw):
                          f"Thank you! Your Score Predictor access code is:\n{code}\n"
                          f"Valid for {label.split(' (')[0].lower()} from now. "
                          "Enter it on the site and tap Unlock.")
+        st.divider()
+        manual_admin()
+        st.divider()
         if st.button("Log out"):
             st.session_state["admin_ok"] = False
             st.rerun()
