@@ -59,9 +59,11 @@ body {background:#050a1c;}
   padding-bottom:.7rem; color:#fff; text-shadow:0 2px 14px rgba(0,0,0,.9);}
 .hero-t {font-size:2.1rem; font-weight:800; line-height:1.1;}
 .hero-s {opacity:.85; font-size:.9rem;}
-.st-key-sheet {position:relative; z-index:1; background:rgba(255,255,255,.94); border-radius:22px 22px 0 0;
+:root {--sheet-bg: rgba(255,255,255,.97);}
+.st-key-sheet {position:relative; z-index:1; background:var(--sheet-bg); border-radius:22px 22px 0 0;
   padding:1rem 1rem 2rem 1rem; box-shadow:0 -6px 24px rgba(0,0,0,.4);}
-@media (prefers-color-scheme: dark) {.st-key-sheet {background:rgba(14,17,23,.92);}}
+/* solid toolbar so page content never shows through behind the Share / star / menu icons */
+[data-testid="stHeader"] {background:var(--sheet-bg) !important; backdrop-filter:blur(6px);}
 </style>
 """, unsafe_allow_html=True)
 
@@ -358,16 +360,16 @@ VIRTUAL_HTML_3D_TEMPLATE = """
  #w{position:fixed;inset:0;overflow:hidden;background:#050a1c;
     --u:5px;font-family:'Arial Black',Impact,Arial,sans-serif;font-style:italic;color:#fff}
  canvas{position:absolute;inset:0;width:100%;height:100%;display:block}
- #sb{position:absolute;left:2.5%;top:4%;display:flex;gap:calc(var(--u)*.8)}
+ #sb{position:absolute;left:2.5%;top:64px;display:flex;gap:calc(var(--u)*.8)}
  .box{background:rgba(8,12,28,.88);border-radius:calc(var(--u)*1);padding:calc(var(--u)*.8) calc(var(--u)*1.5);
       display:flex;align-items:center;gap:calc(var(--u)*1.1);font-size:calc(var(--u)*3.3);line-height:1}
  .chip{display:inline-block;width:calc(var(--u)*1.1);height:calc(var(--u)*3.4);border-radius:2px;border:1px solid rgba(255,255,255,.6)}
  .sc{color:#ffd43b}
- #live{position:absolute;right:2.5%;top:4%;background:rgba(8,12,28,.88);border-radius:calc(var(--u)*1);
+ #live{position:absolute;right:2.5%;top:64px;background:rgba(8,12,28,.88);border-radius:calc(var(--u)*1);
        padding:calc(var(--u)*.9) calc(var(--u)*1.5);font-size:calc(var(--u)*2.5);display:flex;align-items:center;gap:calc(var(--u)*.8)}
  #live i{display:inline-block;width:calc(var(--u)*1.5);height:calc(var(--u)*1.5);border-radius:50%;background:#ef4444;animation:bl 1s infinite}
  @keyframes bl{50%{opacity:.25}}
- #cm{position:absolute;left:50%;bottom:5%;transform:translateX(-50%);background:rgba(8,12,28,.88);opacity:0;
+ #cm{position:absolute;left:50%;top:calc(64px + var(--u)*8);transform:translateX(-50%);background:rgba(8,12,28,.88);opacity:0;
      border-radius:calc(var(--u)*3);padding:calc(var(--u)*.9) calc(var(--u)*3);font-size:calc(var(--u)*3.6);white-space:nowrap}
  #goal{position:absolute;left:0;right:0;top:14%;text-align:center;font-size:calc(var(--u)*17);color:#ffe066;display:none;
        -webkit-text-stroke:calc(var(--u)*.6) #7a0a0a;text-shadow:0 calc(var(--u)*.8) calc(var(--u)*2) rgba(0,0,0,.7);
@@ -388,6 +390,14 @@ VIRTUAL_HTML_3D_TEMPLATE = """
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 const FALLBACK=__FALLBACK__;
+function syncTheme(){
+  try{
+    const d=window.parent.document,app=d.querySelector('.stApp')||d.body;
+    const m=getComputedStyle(app).color.match(/[0-9.]+/g),l=(m[0]*.3+m[1]*.59+m[2]*.11)/255;
+    d.documentElement.style.setProperty('--sheet-bg',l<.5?'rgba(255,255,255,.97)':'rgba(14,17,23,.97)');
+  }catch(e){}
+}
+syncTheme();setInterval(syncTheme,1500);
 (function(){
 function fallback(){try{document.open();document.write(FALLBACK);document.close()}catch(e){}}
 if(typeof THREE==='undefined'){fallback();return}
