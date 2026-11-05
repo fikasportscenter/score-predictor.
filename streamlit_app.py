@@ -11,7 +11,6 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
 
   HIGHLIGHTLY_KEY = "your highlightly key"   (adds ALL matches of ALL leagues)
   HL_DAILY_BUDGET = "90"      (free plan = 100 requests a day; on the paid plan use "7000")
-  HL_HIST_DAYS    = "21"      (days of past results; on the paid plan use "30")
 
 Optional file beside this one: injuries.txt  (one line per team, see the file itself)
 """
@@ -747,9 +746,7 @@ def manual_admin():
 
 # ---------- all matches of all leagues (Highlightly, optional) ----------
 import re
-import tempfile
 import threading
-import urllib.error
 
 
 def hl_key():
@@ -761,70 +758,17 @@ def hl_key():
 
 
 HL_DAYS = 3         # fixtures: today + next 2 days (UTC dates)
-def _int_setting(name, default):
-    try:
-        return int(float(secret(name, str(default))))
-    except ValueError:
-        return default
-
-
-HL_HIST_DAYS = _int_setting("HL_HIST_DAYS", 21)   # days of finished matches used for team form
-HL_GAP = _int_setting("HL_GAP_MS", 900) / 1000.0  # pause between requests (seconds)
+HL_HIST_DAYS = 30   # finished matches used for team form
 HL_MAX_PAGES = 6    # 100 matches per page
-
-
-HL_CACHE = Path(tempfile.gettempdir()) / "score_predictor_hl.json"
-
-
-def _m_dump(m):
-    d = dict(m)
-    d["when"] = m["when"].isoformat()
-    return d
-
-
-def _m_load(d):
-    m = dict(d)
-    m["when"] = datetime.fromisoformat(d["when"]).astimezone(UG_TZ)
-    m["score"] = tuple(d["score"]) if d.get("score") else None
-    return m
-
-
-def _hl_save(h):
-    """Best effort: keeps what was collected if the app restarts."""
-    try:
-        blob = {"day": h["day"], "used": h["used"], "fx_t": h["fx_t"], "fx_ok": h["fx_ok"],
-                "fx": [_m_dump(m) for m in h["fx"]],
-                "days": {d: [_m_dump(m) for m in ms] for d, ms in list(h["days"].items())}}
-        HL_CACHE.write_text(json.dumps(blob), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def _hl_load(h):
-    try:
-        blob = json.loads(HL_CACHE.read_text(encoding="utf-8"))
-        h["day"], h["used"] = blob.get("day", ""), int(blob.get("used", 0))
-        h["fx_t"], h["fx_ok"] = float(blob.get("fx_t", 0)), bool(blob.get("fx_ok"))
-        h["fx"] = [_m_load(m) for m in blob.get("fx", [])]
-        h["days"] = {d: [_m_load(m) for m in ms] for d, ms in blob.get("days", {}).items()}
-        h["rev"] = 1
-    except Exception:
-        pass
+HL_PER_RUN = 40     # at most this many history requests per page load
 
 
 @st.cache_resource(show_spinner=False)
 def _hl_state():
-    h = _hl_new()
-    _hl_load(h)
-    return h
-
-
-def _hl_new():
     return {"lock": threading.Lock(), "day": "", "used": 0,
             "fx_t": 0.0, "fx_ok": False, "fx": [], "fx_err": "",
             "days": {}, "hist_t": 0.0, "rev": 0, "err": "",
-            "pools": {}, "pools_rev": -1, "preds": {},
-            "gap_lock": threading.Lock(), "last": 0.0, "running": False, "budget": 90}
+            "pools": {}, "pools_rev": -1, "preds": {}}
 
 
 def hl_budget():
@@ -835,37 +779,20 @@ def hl_budget():
 
 
 def _hl_get(path, params, key):
-    """One Highlightly request: spaced out, counted against the daily budget,
-    and retried after a pause when Highlightly answers 429 (too many requests)."""
+    """One Highlightly request, counted against the daily budget."""
     h = _hl_state()
-    url = ("https://soccer.highlightly.net" + path + "?" + urllib.parse.urlencode(params))
-    for attempt in range(4):
-        today = datetime.now(timezone.utc).date().isoformat()
-        if h["day"] != today:
-            h["day"], h["used"] = today, 0
-        if h["used"] >= h["budget"]:
-            raise RuntimeError("daily request limit reached")
-        with h["gap_lock"]:
-            wait = h["last"] + HL_GAP - time.time()
-            if wait > 0:
-                time.sleep(wait)
-            h["last"] = time.time()
-        h["used"] += 1
-        req = urllib.request.Request(url, headers={
-            "x-rapidapi-key": key, "Accept": "application/json",
-            "User-Agent": "score-predictor"})
-        try:
-            with urllib.request.urlopen(req, timeout=25) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < 3:
-                try:
-                    delay = float(e.headers.get("Retry-After"))
-                except (TypeError, ValueError):
-                    delay = 8.0 * (attempt + 1)
-                time.sleep(min(delay, 30.0))
-                continue
-            raise
+    today = datetime.now(timezone.utc).date().isoformat()
+    if h["day"] != today:
+        h["day"], h["used"] = today, 0
+    if h["used"] >= hl_budget():
+        raise RuntimeError("daily request limit reached")
+    h["used"] += 1
+    req = urllib.request.Request(
+        "https://soccer.highlightly.net" + path + "?" + urllib.parse.urlencode(params),
+        headers={"x-rapidapi-key": key, "Accept": "application/json",
+                 "User-Agent": "score-predictor"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return json.loads(r.read().decode("utf-8"))
 
 
 def _nm(x):
@@ -941,7 +868,6 @@ def world_matches():
     if not key:
         return [], "no key"
     h = _hl_state()
-    h["budget"] = hl_budget()
     with h["lock"]:
         age = time.time() - h["fx_t"]
         if h["fx_t"] and age < (8 * 3600 if h["fx_ok"] else 600):
@@ -963,27 +889,34 @@ def world_matches():
         if uniq or not h["fx"]:
             h["fx"] = uniq
         h.update(fx_t=time.time(), fx_ok=bool(uniq) or h["fx_ok"], fx_err=err)
-        _hl_save(h)
         return h["fx"], err
 
 
-def _hist_worker(key):
-    """Runs in the background: collects finished matches, newest day first."""
+def refresh_history():
+    """Collects finished matches of the last HL_HIST_DAYS days, a few requests at a time."""
+    key = hl_key()
     h = _hl_state()
+    if not key or not h["lock"].acquire(blocking=False):
+        return
     try:
+        if time.time() - h["hist_t"] < 120:
+            return
         today = datetime.now(timezone.utc).date()
         want = [(today - timedelta(days=i)).isoformat() for i in range(1, HL_HIST_DAYS + 1)]
-        for d in [d for d in list(h["days"]) if d not in want]:
-            h["days"].pop(d, None)
-            h["rev"] += 1
+        for d in [d for d in h["days"] if d not in want]:
+            del h["days"][d]; h["rev"] += 1
+        left = HL_PER_RUN
         for d in want:
             if d in h["days"]:
                 continue
+            if left <= 0:
+                break
             try:
-                rows, _ = _fetch_day(d, key)
+                rows, calls = _fetch_day(d, key, max_calls=left)
             except Exception as e:
                 h["err"] = f"{type(e).__name__}: {e}"
                 break
+            left -= calls
             fin = []
             for r in rows:
                 m = _norm(r)
@@ -992,25 +925,9 @@ def _hist_worker(key):
             h["days"][d] = fin
             h["rev"] += 1
             h["err"] = ""
-            _hl_save(h)
-    finally:
         h["hist_t"] = time.time()
-        h["running"] = False
-
-
-def refresh_history():
-    """Starts the background collector when some days are still missing."""
-    key = hl_key()
-    h = _hl_state()
-    if not key or h["running"] or time.time() - h["hist_t"] < 120:
-        return
-    today = datetime.now(timezone.utc).date()
-    if all((today - timedelta(days=i)).isoformat() in h["days"]
-           for i in range(1, HL_HIST_DAYS + 1)):
-        return
-    h["budget"] = hl_budget()
-    h["running"] = True
-    threading.Thread(target=_hist_worker, args=(key,), daemon=True).start()
+    finally:
+        h["lock"].release()
 
 
 def _pools():
@@ -1018,7 +935,7 @@ def _pools():
     h = _hl_state()
     if h["pools_rev"] != h["rev"]:
         pools = {}
-        for day, ms in list(h["days"].items()):
+        for day, ms in h["days"].items():
             for m in ms:
                 row = {"date": datetime.strptime(m["when"].strftime("%Y-%m-%d"), "%Y-%m-%d"),
                        "home": m["home"], "away": m["away"],
@@ -1174,25 +1091,6 @@ def picks_tab(has_access, key):
     st.caption("Model estimates from recent form. Not guarantees and not betting advice.")
 
 
-def owner_hl_info(ms):
-    """Owner-only status of the Highlightly data (shown on the All leagues tab)."""
-    if not st.session_state.get("admin_ok"):
-        return
-    h = _hl_state()
-    pr_n = sum(1 for m in ms if m.get("pool") and m.get("pr"))
-    st.caption(f"Owner info: fixtures {len(h['fx'])}"
-               f"{' (error: ' + h['fx_err'] + ')' if h['fx_err'] else ''}; "
-               f"history {len(h['days'])}/{HL_HIST_DAYS} days, "
-               f"{sum(len(v) for v in list(h['days'].values()))} finished matches, "
-               f"{len(_pools())} leagues; predicted {pr_n} of "
-               f"{sum(1 for m in ms if m.get('pool'))} extra fixtures shown; "
-               f"requests today {h['used']}/{hl_budget()}"
-               f"{'; history error: ' + h['err'] if h['err'] else ''}")
-    if st.button("🔄 Reload other leagues now", key="hl_retry"):
-        h.update(fx_t=0.0, hist_t=0.0)
-        st.rerun()
-
-
 def all_tab(has_access, key):
     """Every league: all upcoming fixtures. Full predictions for paying clients only."""
     with st.spinner("Loading all leagues (first time can take ~30 seconds)..."):
@@ -1208,7 +1106,6 @@ def all_tab(has_access, key):
     ms = model_ms + extra
     if not ms:
         st.info("No upcoming fixtures found in the data right now. Check again later.")
-        owner_hl_info(ms)
         return
     ms.sort(key=lambda m: (m["ugd"], m["ugt"] or "99:99", m["league"]))
     today = datetime.now(UG_TZ).date()
@@ -1223,12 +1120,15 @@ def all_tab(has_access, key):
         ms = [m for m in ms if m["league"] == pick]
     st.caption(f"{len(ms)} match{'' if len(ms) == 1 else 'es'} · "
                f"{len({m['league'] for m in ms})} league(s). Times are Uganda time (EAT).")
-    _h = _hl_state()
-    if hl_key() and len(_h["days"]) < HL_HIST_DAYS:
-        st.info(f"⏳ We are still collecting recent results for the other leagues "
-                f"({len(_h['days'])} of {HL_HIST_DAYS} days). More predictions and "
-                "analysis buttons will appear over the next few minutes. Reload to see them.")
-    owner_hl_info(ms)
+    if st.session_state.get("admin_ok"):
+        h = _hl_state()
+        pr_n = sum(1 for m in ms if m.get("pool") and m.get("pr"))
+        st.caption(f"Owner info: history {len(h['days'])}/{HL_HIST_DAYS} days, "
+                   f"{sum(len(v) for v in h['days'].values())} finished matches, "
+                   f"{len(_pools())} leagues; predicted {pr_n} of "
+                   f"{sum(1 for m in ms if m.get('pool'))} extra fixtures shown; "
+                   f"requests today {h['used']}/{hl_budget()}"
+                   f"{'; last error: ' + h['err'] if h['err'] else ''}")
     if not has_access and any(m.get("pr") for m in ms):
         st.markdown("**🔒 Predictions for every league are for paying clients. "
                     "Unlock to see the predicted score, win chances, goals and "
