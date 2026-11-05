@@ -1,5 +1,5 @@
 """Football score predictor - paid access (access codes). Phone-friendly Streamlit app.
-Needs predictor_nokey.py and picks.py beside it.
+Needs predictor_nokey.py beside it.
 
 Secrets to set in Streamlit (Manage app > Settings > Secrets):
   CODE_SECRET      = "long random text, keep private"
@@ -8,6 +8,8 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
   PAY_INSTRUCTIONS = "Send to MTN MoMo 07XXXXXXXX (Your Name)"
   WHATSAPP_NUMBER  = "2567XXXXXXXX"      (international format, no +)
   FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (same-day results + key players)
+
+  HIGHLIGHTLY_KEY = "your highlightly key"   (adds ALL matches of ALL leagues)
 
 Optional file beside this one: injuries.txt  (one line per team, see the file itself)
 """
@@ -49,11 +51,18 @@ st.markdown("""
 .pill.lock {background:#e5e7eb; color:#555;}
 .pill.miss {background:#fde2e2; color:#7f1d1d;}
 .day {margin:18px 0 6px 0; font-weight:700; opacity:.65; text-transform:uppercase; font-size:.8rem; letter-spacing:.06em;}
+.hdr {display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin:0 0 .6rem 0;}
+.hdr .ttl {font-size:2.2rem; font-weight:700; line-height:1.15; flex:1;}
+.live {min-width:150px; max-width:50%; border:1px solid rgba(128,128,128,.35); border-radius:12px; padding:8px 10px; font-size:.8rem; line-height:1.3;}
+.live .dot {color:#e11d48; font-weight:800;}
+.live .row {margin-top:5px;}
+.live .sc {font-weight:800;}
+.live .lg {opacity:.6; font-size:.72rem;}
+.live .none {opacity:.7;}
 </style>
 """, unsafe_allow_html=True)
 
 PASSES = {"Daily (24 hours)": 24, "Weekly (7 days)": 24 * 7, "Monthly (30 days)": 24 * 30}
-
 
 # ---------- access codes ----------
 def secret(name, default=""):
@@ -219,6 +228,65 @@ def merge_live_results(cache):
         return added
     except Exception:
         return 0
+
+
+# ---------- live scores (top of page) ----------
+@st.cache_data(ttl=60, show_spinner=False)
+def live_matches():
+    """Matches in play right now (football-data.org free key). Cached 60 seconds.
+    Never raises: returns [] on any problem."""
+    token = secret("FOOTBALL_DATA_ORG_KEY")
+    if not token:
+        return []
+    try:
+        req = urllib.request.Request(
+            "https://api.football-data.org/v4/matches?status=IN_PLAY,PAUSED",
+            headers={"X-Auth-Token": token})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        out = []
+        for m in data.get("matches") or []:
+            sc = m.get("score") or {}
+            ft = sc.get("fullTime") or {}
+            if ft.get("home") is None:
+                ft = sc.get("halfTime") or {}
+            h, a = m.get("homeTeam") or {}, m.get("awayTeam") or {}
+            hn, an = h.get("shortName") or h.get("name"), a.get("shortName") or a.get("name")
+            if not hn or not an:
+                continue
+            if m.get("status") == "PAUSED":
+                when = "HT"
+            elif m.get("minute") is not None:
+                when = f"{m['minute']}'"
+            else:
+                when = "LIVE"
+            out.append({"league": (m.get("competition") or {}).get("name", ""),
+                        "home": hn, "away": an, "when": when,
+                        "hg": ft.get("home") if ft.get("home") is not None else 0,
+                        "ag": ft.get("away") if ft.get("away") is not None else 0})
+        return out
+    except Exception:
+        return []
+
+
+def _live_header():
+    ms = live_matches()
+    if ms:
+        rows = "".join(
+            f"<div class='row'><span class='lg'>{html.escape(m['league'])}</span><br>"
+            f"<span class='dot'>{html.escape(str(m['when']))}</span> "
+            f"{html.escape(m['home'])} <span class='sc'>{m['hg']}-{m['ag']}</span> "
+            f"{html.escape(m['away'])}</div>" for m in ms[:3])
+        more = f"<div class='row lg'>+{len(ms) - 3} more live</div>" if len(ms) > 3 else ""
+        body = f"<div><span class='dot'>🔴 LIVE NOW</span></div>{rows}{more}"
+    else:
+        body = "<div class='none'>📡 Live scores<br>No match in play right now</div>"
+    st.markdown(f"<div class='hdr'><div class='ttl'>⚽ Score Predictor</div>"
+                f"<div class='live'>{body}</div></div>", unsafe_allow_html=True)
+
+
+_frag = getattr(st, "fragment", None)   # refreshes just this box every minute
+live_header = _frag(run_every="60s")(_live_header) if _frag else _live_header
 
 
 # ---------- key players and injuries ----------
@@ -675,6 +743,118 @@ def manual_admin():
                    "may be cleared if the app is rebooted or redeployed.")
 
 
+# ---------- all matches of all leagues (Highlightly, optional) ----------
+import threading
+
+
+def hl_key():
+    for n in ("HIGHLIGHTLY_KEY", "HIGHLIGHTLY_API_KEY", "HIGHLIGHTLY"):
+        v = secret(n).strip()
+        if v:
+            return v
+    return ""
+
+
+def _hl_get(path, params, key):
+    req = urllib.request.Request(
+        "https://soccer.highlightly.net" + path + "?" + urllib.parse.urlencode(params),
+        headers={"x-rapidapi-key": key, "Accept": "application/json",
+                 "User-Agent": "score-predictor"})
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _nm(x):
+    return (x.get("name") if isinstance(x, dict) else x) or ""
+
+
+def _hl_time(text):
+    """ISO text -> aware datetime (naive text is treated as UTC)."""
+    dt = datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+HL_DAYS = 3        # today + next 2 days (UTC dates)
+HL_MAX_PAGES = 6   # 100 matches per page -> at most 600 matches a day
+
+
+@st.cache_resource(show_spinner=False)
+def _world_holder():
+    return {"t": 0.0, "ok": False, "data": [], "err": "", "lock": threading.Lock()}
+
+
+def world_matches():
+    """Every fixture of every league from Highlightly: (list, error_text).
+    Shared by all visitors, refreshed every 8 hours (10 minutes after a failure).
+    Never raises."""
+    key = hl_key()
+    if not key:
+        return [], "no key"
+    h = _world_holder()
+    with h["lock"]:
+        age = time.time() - h["t"]
+        if h["t"] and age < (8 * 3600 if h["ok"] else 600):
+            return h["data"], h["err"]
+        out, err = [], ""
+        try:
+            today = datetime.now(timezone.utc).date()
+            for d in range(HL_DAYS):
+                day = (today + timedelta(days=d)).isoformat()
+                for page in range(HL_MAX_PAGES):
+                    data = _hl_get("/matches", {"date": day, "limit": 100,
+                                                "offset": page * 100}, key)
+                    rows = data.get("data") or []
+                    for r in rows:
+                        hn, an = _nm(r.get("homeTeam")), _nm(r.get("awayTeam"))
+                        if not hn or not an or not r.get("date"):
+                            continue
+                        try:
+                            when = _hl_time(r["date"]).astimezone(UG_TZ)
+                        except Exception:
+                            continue
+                        st_ = r.get("state") or {}
+                        out.append({"id": r.get("id"), "when": when,
+                                    "country": _nm(r.get("country")),
+                                    "league": _nm(r.get("league")),
+                                    "home": hn, "away": an,
+                                    "state": str(st_.get("description") or "")})
+                    total = (data.get("pagination") or {}).get("totalCount")
+                    if len(rows) < 100 or (total is not None and (page + 1) * 100 >= total):
+                        break
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+        seen, uniq = set(), []
+        for m in out:           # the same match can appear on two UTC dates
+            k = (m["id"], m["home"], m["away"], m["when"])
+            if k not in seen:
+                seen.add(k)
+                uniq.append(m)
+        h.update(t=time.time(), ok=bool(uniq), data=uniq, err=err)
+        return uniq, err
+
+
+def world_extra(model_ms):
+    """Highlightly fixtures that the model list does not already contain."""
+    wm, _err = world_matches()
+    by_day = {}
+    for m in model_ms:
+        by_day.setdefault(m["ugd"], []).append((_toks(m["home"]), _toks(m["away"])))
+
+    def same(a, b):
+        return bool(a) and bool(b) and (a <= b or b <= a)
+
+    extra = []
+    for w in wm:
+        d = w["when"].date()
+        ht, at = _toks(w["home"]), _toks(w["away"])
+        if any(same(ht, mh) and same(at, ma) for mh, ma in by_day.get(d, [])):
+            continue
+        lg = f"{w['country']} · {w['league']}" if w["country"] else w["league"]
+        extra.append({"ugd": d, "ugt": w["when"].strftime("%H:%M"), "league": lg or "Other",
+                      "home": w["home"], "away": w["away"], "pr": None, "state": w["state"]})
+    return extra
+
+
 # ---------- paywall screens ----------
 FREE_PICKS = 1   # how many matches free visitors see in full on the Top picks tab
 
@@ -754,17 +934,22 @@ def picks_tab(has_access, key):
 
 
 def all_tab(has_access, key):
-    """Every league: all upcoming fixtures. Full predictions for paid clients only."""
+    """Every league: all upcoming fixtures. Full predictions for paying clients only."""
     with st.spinner("Loading all leagues (first time can take ~30 seconds)..."):
         res, err = get_all_matches()
-    if err:
+        if err:
+            res = {"matches": [], "skipped": 0}
+        model_ms = sorted(with_ug([dict(m) for m in res["matches"]]),
+                          key=lambda m: (m["ugd"], m["ugt"] or "99:99", m["league"]))
+        extra = world_extra(model_ms)
+    if err and not extra:
         st.error(err)
         return
-    ms = res["matches"]
+    ms = model_ms + extra
     if not ms:
         st.info("No upcoming fixtures found in the data right now. Check again later.")
         return
-    ms = sorted(with_ug([dict(m) for m in ms]), key=lambda m: (m["ugd"], m["ugt"] or "99:99", m["league"]))
+    ms.sort(key=lambda m: (m["ugd"], m["ugt"] or "99:99", m["league"]))
     today = datetime.now(UG_TZ).date()
     span = st.radio("Show matches", ["Today", "Tomorrow", "Next 3 days", "Next 7 days"],
                     horizontal=True, key="all_span")
@@ -777,7 +962,7 @@ def all_tab(has_access, key):
         ms = [m for m in ms if m["league"] == pick]
     st.caption(f"{len(ms)} match{'' if len(ms) == 1 else 'es'} · "
                f"{len({m['league'] for m in ms})} league(s). Times are Uganda time (EAT).")
-    if not has_access:
+    if not has_access and any(m.get("pr") for m in ms):
         st.markdown("**🔒 Predictions for every league are for paying clients. "
                     "Unlock to see the predicted score, win chances, goals and "
                     "full analysis for each match below.**")
@@ -793,7 +978,10 @@ def all_tab(has_access, key):
                         unsafe_allow_html=True)
         head = (f"<div class='meta'>{html.escape(m['league'])} · {html.escape(m['ugt'])}</div>"
                 f"<div class='vs'>{html.escape(m['home'])} vs {html.escape(m['away'])}</div>")
-        if has_access:
+        if not m.get("pr"):
+            st_txt = f" · {html.escape(m['state'])}" if m.get("state") and m["state"].lower() not in ("not started", "scheduled") else ""
+            pills = f"<span class='pill'>📅 Fixture{st_txt}</span><span class='pill lock'>No prediction for this league yet</span>"
+        elif has_access:
             pr = m["pr"]
             (i, j), _ = pr["top"][0]
             pills = (f"<span class='pill hot'>Score {i}-{j}</span>"
@@ -807,7 +995,7 @@ def all_tab(has_access, key):
         else:
             pills = "<span class='pill lock'>🔒 Prediction locked</span>"
         st.markdown(f"<div class='pick'>{head}{pills}</div>", unsafe_allow_html=True)
-        if has_access:
+        if has_access and m.get("pr"):
             pid = f"{m['home']}|{m['away']}"
             opened = st.session_state.get("open_all") == pid
             if st.button("✖ Close analysis" if opened else "📈 See analysis",
@@ -937,10 +1125,10 @@ if not has_access:
         notice = ("warning", info)
         st.session_state.pop("code", None)
 
-st.title("⚽ Score Predictor")
-
+live_header()
 if notice:
     getattr(st, notice[0])(notice[1])
+
 tab_picks, tab_all, tab_results, tab_pred = st.tabs(
     ["🔥 Top picks", "🌍 All leagues", "📊 Results", "🔍 Predict a match"])
 with tab_picks:
