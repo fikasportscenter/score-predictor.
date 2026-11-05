@@ -747,6 +747,7 @@ def manual_admin():
 
 # ---------- all matches of all leagues (Highlightly, optional) ----------
 import re
+import tempfile
 import threading
 import urllib.error
 
@@ -772,8 +773,53 @@ HL_GAP = _int_setting("HL_GAP_MS", 900) / 1000.0  # pause between requests (seco
 HL_MAX_PAGES = 6    # 100 matches per page
 
 
+HL_CACHE = Path(tempfile.gettempdir()) / "score_predictor_hl.json"
+
+
+def _m_dump(m):
+    d = dict(m)
+    d["when"] = m["when"].isoformat()
+    return d
+
+
+def _m_load(d):
+    m = dict(d)
+    m["when"] = datetime.fromisoformat(d["when"]).astimezone(UG_TZ)
+    m["score"] = tuple(d["score"]) if d.get("score") else None
+    return m
+
+
+def _hl_save(h):
+    """Best effort: keeps what was collected if the app restarts."""
+    try:
+        blob = {"day": h["day"], "used": h["used"], "fx_t": h["fx_t"], "fx_ok": h["fx_ok"],
+                "fx": [_m_dump(m) for m in h["fx"]],
+                "days": {d: [_m_dump(m) for m in ms] for d, ms in list(h["days"].items())}}
+        HL_CACHE.write_text(json.dumps(blob), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _hl_load(h):
+    try:
+        blob = json.loads(HL_CACHE.read_text(encoding="utf-8"))
+        h["day"], h["used"] = blob.get("day", ""), int(blob.get("used", 0))
+        h["fx_t"], h["fx_ok"] = float(blob.get("fx_t", 0)), bool(blob.get("fx_ok"))
+        h["fx"] = [_m_load(m) for m in blob.get("fx", [])]
+        h["days"] = {d: [_m_load(m) for m in ms] for d, ms in blob.get("days", {}).items()}
+        h["rev"] = 1
+    except Exception:
+        pass
+
+
 @st.cache_resource(show_spinner=False)
 def _hl_state():
+    h = _hl_new()
+    _hl_load(h)
+    return h
+
+
+def _hl_new():
     return {"lock": threading.Lock(), "day": "", "used": 0,
             "fx_t": 0.0, "fx_ok": False, "fx": [], "fx_err": "",
             "days": {}, "hist_t": 0.0, "rev": 0, "err": "",
@@ -917,6 +963,7 @@ def world_matches():
         if uniq or not h["fx"]:
             h["fx"] = uniq
         h.update(fx_t=time.time(), fx_ok=bool(uniq) or h["fx_ok"], fx_err=err)
+        _hl_save(h)
         return h["fx"], err
 
 
@@ -945,6 +992,7 @@ def _hist_worker(key):
             h["days"][d] = fin
             h["rev"] += 1
             h["err"] = ""
+            _hl_save(h)
     finally:
         h["hist_t"] = time.time()
         h["running"] = False
@@ -1126,6 +1174,25 @@ def picks_tab(has_access, key):
     st.caption("Model estimates from recent form. Not guarantees and not betting advice.")
 
 
+def owner_hl_info(ms):
+    """Owner-only status of the Highlightly data (shown on the All leagues tab)."""
+    if not st.session_state.get("admin_ok"):
+        return
+    h = _hl_state()
+    pr_n = sum(1 for m in ms if m.get("pool") and m.get("pr"))
+    st.caption(f"Owner info: fixtures {len(h['fx'])}"
+               f"{' (error: ' + h['fx_err'] + ')' if h['fx_err'] else ''}; "
+               f"history {len(h['days'])}/{HL_HIST_DAYS} days, "
+               f"{sum(len(v) for v in list(h['days'].values()))} finished matches, "
+               f"{len(_pools())} leagues; predicted {pr_n} of "
+               f"{sum(1 for m in ms if m.get('pool'))} extra fixtures shown; "
+               f"requests today {h['used']}/{hl_budget()}"
+               f"{'; history error: ' + h['err'] if h['err'] else ''}")
+    if st.button("🔄 Reload other leagues now", key="hl_retry"):
+        h.update(fx_t=0.0, hist_t=0.0)
+        st.rerun()
+
+
 def all_tab(has_access, key):
     """Every league: all upcoming fixtures. Full predictions for paying clients only."""
     with st.spinner("Loading all leagues (first time can take ~30 seconds)..."):
@@ -1141,6 +1208,7 @@ def all_tab(has_access, key):
     ms = model_ms + extra
     if not ms:
         st.info("No upcoming fixtures found in the data right now. Check again later.")
+        owner_hl_info(ms)
         return
     ms.sort(key=lambda m: (m["ugd"], m["ugt"] or "99:99", m["league"]))
     today = datetime.now(UG_TZ).date()
@@ -1160,15 +1228,7 @@ def all_tab(has_access, key):
         st.info(f"⏳ We are still collecting recent results for the other leagues "
                 f"({len(_h['days'])} of {HL_HIST_DAYS} days). More predictions and "
                 "analysis buttons will appear over the next few minutes. Reload to see them.")
-    if st.session_state.get("admin_ok"):
-        h = _hl_state()
-        pr_n = sum(1 for m in ms if m.get("pool") and m.get("pr"))
-        st.caption(f"Owner info: history {len(h['days'])}/{HL_HIST_DAYS} days, "
-                   f"{sum(len(v) for v in h['days'].values())} finished matches, "
-                   f"{len(_pools())} leagues; predicted {pr_n} of "
-                   f"{sum(1 for m in ms if m.get('pool'))} extra fixtures shown; "
-                   f"requests today {h['used']}/{hl_budget()}"
-                   f"{'; last error: ' + h['err'] if h['err'] else ''}")
+    owner_hl_info(ms)
     if not has_access and any(m.get("pr") for m in ms):
         st.markdown("**🔒 Predictions for every league are for paying clients. "
                     "Unlock to see the predicted score, win chances, goals and "
