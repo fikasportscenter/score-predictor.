@@ -899,7 +899,7 @@ def refresh_history():
     if not key or not h["lock"].acquire(blocking=False):
         return
     try:
-        if time.time() - h["hist_t"] < 600:
+        if time.time() - h["hist_t"] < 120:
             return
         today = datetime.now(timezone.utc).date()
         want = [(today - timedelta(days=i)).isoformat() for i in range(1, HL_HIST_DAYS + 1)]
@@ -997,8 +997,9 @@ def world_extra(model_ms):
         lg = f"{w['country']} · {w['league']}" if w["country"] else w["league"]
         item = {"ugd": d, "ugt": w["when"].strftime("%H:%M"), "league": lg or "Other",
                 "home": w["home"], "away": w["away"], "pr": None, "state": w["state"],
-                "pool": pool}
-        got = world_predict(pool, w["home"], w["away"])
+                "pool": pool, "score": w.get("score")}
+        over = "finish" in w["state"].lower()
+        got = None if over else world_predict(pool, w["home"], w["away"])
         if got:
             item["pr"], item["over15"] = got["pr"], got["over15"]
         extra.append(item)
@@ -1119,6 +1120,15 @@ def all_tab(has_access, key):
         ms = [m for m in ms if m["league"] == pick]
     st.caption(f"{len(ms)} match{'' if len(ms) == 1 else 'es'} · "
                f"{len({m['league'] for m in ms})} league(s). Times are Uganda time (EAT).")
+    if st.session_state.get("admin_ok"):
+        h = _hl_state()
+        pr_n = sum(1 for m in ms if m.get("pool") and m.get("pr"))
+        st.caption(f"Owner info: history {len(h['days'])}/{HL_HIST_DAYS} days, "
+                   f"{sum(len(v) for v in h['days'].values())} finished matches, "
+                   f"{len(_pools())} leagues; predicted {pr_n} of "
+                   f"{sum(1 for m in ms if m.get('pool'))} extra fixtures shown; "
+                   f"requests today {h['used']}/{hl_budget()}"
+                   f"{'; last error: ' + h['err'] if h['err'] else ''}")
     if not has_access and any(m.get("pr") for m in ms):
         st.markdown("**🔒 Predictions for every league are for paying clients. "
                     "Unlock to see the predicted score, win chances, goals and "
@@ -1136,8 +1146,17 @@ def all_tab(has_access, key):
         head = (f"<div class='meta'>{html.escape(m['league'])} · {html.escape(m['ugt'])}</div>"
                 f"<div class='vs'>{html.escape(m['home'])} vs {html.escape(m['away'])}</div>")
         if not m.get("pr"):
-            st_txt = f" · {html.escape(m['state'])}" if m.get("state") and m["state"].lower() not in ("not started", "scheduled") else ""
-            pills = f"<span class='pill'>📅 Fixture{st_txt}</span><span class='pill lock'>Not enough recent results for a prediction yet</span>"
+            stl = (m.get("state") or "").lower()
+            sc = m.get("score")
+            if "finish" in stl:
+                pills = ("<span class='pill hot'>✅ Full time" + (f" · {sc[0]}-{sc[1]}" if sc else "") +
+                         "</span>")
+            elif stl and stl not in ("not started", "scheduled"):
+                pills = (f"<span class='pill hot'>🔴 {html.escape(m['state'])}" +
+                         (f" · {sc[0]}-{sc[1]}" if sc else "") + "</span>")
+            else:
+                pills = ("<span class='pill'>📅 Fixture</span><span class='pill lock'>"
+                         "Not enough recent results for a prediction yet</span>")
         elif has_access:
             pr = m["pr"]
             (i, j), _ = pr["top"][0]
@@ -1169,15 +1188,6 @@ def all_tab(has_access, key):
                     st.error(aerr)
                 else:
                     show_result(data)
-    if st.session_state.get("admin_ok"):
-        h = _hl_state()
-        pr_n = sum(1 for m in ms if m.get("pool") and m.get("pr"))
-        st.caption(f"Owner info: history {len(h['days'])}/{HL_HIST_DAYS} days, "
-                   f"{sum(len(v) for v in h['days'].values())} finished matches, "
-                   f"{len(_pools())} leagues; predicted {pr_n} of "
-                   f"{sum(1 for m in ms if m.get('pool'))} extra fixtures shown; "
-                   f"requests today {h['used']}/{hl_budget()}"
-                   f"{'; last error: ' + h['err'] if h['err'] else ''}")
     if res["skipped"]:
         st.caption(f"{res['skipped']} fixture(s) left out because there is not enough "
                    "recent data for one of the teams.")
