@@ -10,6 +10,7 @@ Secrets to set in Streamlit (Manage app > Settings > Secrets):
   FOOTBALL_DATA_ORG_KEY = "your football-data.org key"   (same-day results + key players)
 
   HIGHLIGHTLY_KEY = "your highlightly key"   (adds ALL matches of ALL leagues)
+  HL_DAILY_BUDGET = "90"      (free plan = 100 requests a day; on the paid plan use "7000")
 
 Optional file beside this one: injuries.txt  (one line per team, see the file itself)
 """
@@ -744,6 +745,7 @@ def manual_admin():
 
 
 # ---------- all matches of all leagues (Highlightly, optional) ----------
+import re
 import threading
 
 
@@ -755,7 +757,36 @@ def hl_key():
     return ""
 
 
+HL_DAYS = 3         # fixtures: today + next 2 days (UTC dates)
+HL_HIST_DAYS = 30   # finished matches used for team form
+HL_MAX_PAGES = 6    # 100 matches per page
+HL_PER_RUN = 40     # at most this many history requests per page load
+
+
+@st.cache_resource(show_spinner=False)
+def _hl_state():
+    return {"lock": threading.Lock(), "day": "", "used": 0,
+            "fx_t": 0.0, "fx_ok": False, "fx": [], "fx_err": "",
+            "days": {}, "hist_t": 0.0, "rev": 0, "err": "",
+            "pools": {}, "pools_rev": -1, "preds": {}}
+
+
+def hl_budget():
+    try:
+        return int(secret("HL_DAILY_BUDGET", "90"))
+    except ValueError:
+        return 90
+
+
 def _hl_get(path, params, key):
+    """One Highlightly request, counted against the daily budget."""
+    h = _hl_state()
+    today = datetime.now(timezone.utc).date().isoformat()
+    if h["day"] != today:
+        h["day"], h["used"] = today, 0
+    if h["used"] >= hl_budget():
+        raise RuntimeError("daily request limit reached")
+    h["used"] += 1
     req = urllib.request.Request(
         "https://soccer.highlightly.net" + path + "?" + urllib.parse.urlencode(params),
         headers={"x-rapidapi-key": key, "Accept": "application/json",
@@ -774,53 +805,79 @@ def _hl_time(text):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-HL_DAYS = 3        # today + next 2 days (UTC dates)
-HL_MAX_PAGES = 6   # 100 matches per page -> at most 600 matches a day
+def _score_pair(sc):
+    """Pulls (home_goals, away_goals) out of whatever shape the score has."""
+    def from_text(t):
+        m = re.search(r"(\d+)\s*[-:]\s*(\d+)", str(t))
+        return (int(m.group(1)), int(m.group(2))) if m else None
+
+    if isinstance(sc, str):
+        return from_text(sc)
+    if isinstance(sc, dict):
+        for k in ("current", "fullTime", "full_time", "ft", "final"):
+            v = sc.get(k)
+            if v is not None:
+                r = _score_pair(v)
+                if r:
+                    return r
+        h, a = sc.get("home"), sc.get("away")
+        if isinstance(h, int) and isinstance(a, int):
+            return h, a
+        for v in sc.values():
+            if isinstance(v, str):
+                r = from_text(v)
+                if r:
+                    return r
+    return None
 
 
-@st.cache_resource(show_spinner=False)
-def _world_holder():
-    return {"t": 0.0, "ok": False, "data": [], "err": "", "lock": threading.Lock()}
+def _fetch_day(day, key, max_calls=None):
+    """All matches of one UTC date. Returns (rows, calls_used)."""
+    out, calls = [], 0
+    for page in range(HL_MAX_PAGES):
+        if max_calls is not None and calls >= max_calls:
+            raise RuntimeError("page budget used up")
+        data = _hl_get("/matches", {"date": day, "limit": 100, "offset": page * 100}, key)
+        calls += 1
+        rows = data.get("data") or []
+        out += rows
+        total = (data.get("pagination") or {}).get("totalCount")
+        if len(rows) < 100 or (total is not None and (page + 1) * 100 >= total):
+            break
+    return out, calls
+
+
+def _norm(r):
+    hn, an = _nm(r.get("homeTeam")), _nm(r.get("awayTeam"))
+    if not hn or not an or not r.get("date"):
+        return None
+    try:
+        when = _hl_time(r["date"]).astimezone(UG_TZ)
+    except Exception:
+        return None
+    stt = r.get("state") or {}
+    return {"id": r.get("id"), "when": when, "country": _nm(r.get("country")),
+            "league": _nm(r.get("league")), "home": hn, "away": an,
+            "state": str(stt.get("description") or ""), "score": _score_pair(stt.get("score"))}
 
 
 def world_matches():
     """Every fixture of every league from Highlightly: (list, error_text).
-    Shared by all visitors, refreshed every 8 hours (10 minutes after a failure).
-    Never raises."""
+    Refreshed every 8 hours (10 minutes after a failure). Never raises."""
     key = hl_key()
     if not key:
         return [], "no key"
-    h = _world_holder()
+    h = _hl_state()
     with h["lock"]:
-        age = time.time() - h["t"]
-        if h["t"] and age < (8 * 3600 if h["ok"] else 600):
-            return h["data"], h["err"]
+        age = time.time() - h["fx_t"]
+        if h["fx_t"] and age < (8 * 3600 if h["fx_ok"] else 600):
+            return h["fx"], h["fx_err"]
         out, err = [], ""
         try:
             today = datetime.now(timezone.utc).date()
             for d in range(HL_DAYS):
-                day = (today + timedelta(days=d)).isoformat()
-                for page in range(HL_MAX_PAGES):
-                    data = _hl_get("/matches", {"date": day, "limit": 100,
-                                                "offset": page * 100}, key)
-                    rows = data.get("data") or []
-                    for r in rows:
-                        hn, an = _nm(r.get("homeTeam")), _nm(r.get("awayTeam"))
-                        if not hn or not an or not r.get("date"):
-                            continue
-                        try:
-                            when = _hl_time(r["date"]).astimezone(UG_TZ)
-                        except Exception:
-                            continue
-                        st_ = r.get("state") or {}
-                        out.append({"id": r.get("id"), "when": when,
-                                    "country": _nm(r.get("country")),
-                                    "league": _nm(r.get("league")),
-                                    "home": hn, "away": an,
-                                    "state": str(st_.get("description") or "")})
-                    total = (data.get("pagination") or {}).get("totalCount")
-                    if len(rows) < 100 or (total is not None and (page + 1) * 100 >= total):
-                        break
+                rows, _ = _fetch_day((today + timedelta(days=d)).isoformat(), key)
+                out += [m for m in (_norm(r) for r in rows) if m]
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
         seen, uniq = set(), []
@@ -829,13 +886,100 @@ def world_matches():
             if k not in seen:
                 seen.add(k)
                 uniq.append(m)
-        h.update(t=time.time(), ok=bool(uniq), data=uniq, err=err)
-        return uniq, err
+        if uniq or not h["fx"]:
+            h["fx"] = uniq
+        h.update(fx_t=time.time(), fx_ok=bool(uniq) or h["fx_ok"], fx_err=err)
+        return h["fx"], err
+
+
+def refresh_history():
+    """Collects finished matches of the last HL_HIST_DAYS days, a few requests at a time."""
+    key = hl_key()
+    h = _hl_state()
+    if not key or not h["lock"].acquire(blocking=False):
+        return
+    try:
+        if time.time() - h["hist_t"] < 600:
+            return
+        today = datetime.now(timezone.utc).date()
+        want = [(today - timedelta(days=i)).isoformat() for i in range(1, HL_HIST_DAYS + 1)]
+        for d in [d for d in h["days"] if d not in want]:
+            del h["days"][d]; h["rev"] += 1
+        left = HL_PER_RUN
+        for d in want:
+            if d in h["days"]:
+                continue
+            if left <= 0:
+                break
+            try:
+                rows, calls = _fetch_day(d, key, max_calls=left)
+            except Exception as e:
+                h["err"] = f"{type(e).__name__}: {e}"
+                break
+            left -= calls
+            fin = []
+            for r in rows:
+                m = _norm(r)
+                if m and m["score"] and "finish" in m["state"].lower():
+                    fin.append(m)
+            h["days"][d] = fin
+            h["rev"] += 1
+            h["err"] = ""
+        h["hist_t"] = time.time()
+    finally:
+        h["lock"].release()
+
+
+def _pools():
+    """{(country, league): [rows in the predictor's format]} built from the history."""
+    h = _hl_state()
+    if h["pools_rev"] != h["rev"]:
+        pools = {}
+        for day, ms in h["days"].items():
+            for m in ms:
+                row = {"date": datetime.strptime(m["when"].strftime("%Y-%m-%d"), "%Y-%m-%d"),
+                       "home": m["home"], "away": m["away"],
+                       "hg": m["score"][0], "ag": m["score"][1]}
+                for k in p.STAT_COLS:
+                    row[k] = None
+                pools.setdefault((m["country"], m["league"]), []).append(row)
+        h.update(pools=pools, pools_rev=h["rev"], preds={})
+    return h["pools"]
+
+
+def world_predict(pool_key, home, away):
+    """Returns (pred_dict, extras) or None when the league has too little recent data."""
+    h = _hl_state()
+    rows = _pools().get(pool_key)
+    if not rows:
+        return None
+    ck = (pool_key, home, away)
+    if ck in h["preds"]:
+        return h["preds"][ck]
+    res = None
+    try:
+        ratings, avg = p.ratings_from(rows)
+        shot = p.shot_ratings_from(rows)
+        hm, am = p.last_matches(home, rows), p.last_matches(away, rows)
+        if len(hm) >= 3 and len(am) >= 3:
+            hs, as_ = p.summarise(hm, ratings, True, shot), p.summarise(am, ratings, False, shot)
+            pr = p.predict(hs, as_, avg)
+            total = pr["xg_home"] + pr["xg_away"]
+            res = {"pr": pr, "over15": 1 - math.exp(-total) * (1 + total),
+                   "data": {"home": home, "away": away, "hm": hm, "am": am,
+                            "hs": hs, "as": as_, "pred": pr}}
+    except Exception:
+        res = None
+    h["preds"][ck] = res
+    return res
 
 
 def world_extra(model_ms):
     """Highlightly fixtures that the model list does not already contain."""
     wm, _err = world_matches()
+    if not wm:
+        return []
+    refresh_history()
     by_day = {}
     for m in model_ms:
         by_day.setdefault(m["ugd"], []).append((_toks(m["home"]), _toks(m["away"])))
@@ -849,10 +993,23 @@ def world_extra(model_ms):
         ht, at = _toks(w["home"]), _toks(w["away"])
         if any(same(ht, mh) and same(at, ma) for mh, ma in by_day.get(d, [])):
             continue
+        pool = (w["country"], w["league"])
         lg = f"{w['country']} · {w['league']}" if w["country"] else w["league"]
-        extra.append({"ugd": d, "ugt": w["when"].strftime("%H:%M"), "league": lg or "Other",
-                      "home": w["home"], "away": w["away"], "pr": None, "state": w["state"]})
+        item = {"ugd": d, "ugt": w["when"].strftime("%H:%M"), "league": lg or "Other",
+                "home": w["home"], "away": w["away"], "pr": None, "state": w["state"],
+                "pool": pool}
+        got = world_predict(pool, w["home"], w["away"])
+        if got:
+            item["pr"], item["over15"] = got["pr"], got["over15"]
+        extra.append(item)
     return extra
+
+
+def world_compute(pool, home, away):
+    got = world_predict(tuple(pool), home, away)
+    if not got:
+        return None, "Not enough recent matches found for one of the teams."
+    return got["data"], None
 
 
 # ---------- paywall screens ----------
@@ -980,7 +1137,7 @@ def all_tab(has_access, key):
                 f"<div class='vs'>{html.escape(m['home'])} vs {html.escape(m['away'])}</div>")
         if not m.get("pr"):
             st_txt = f" · {html.escape(m['state'])}" if m.get("state") and m["state"].lower() not in ("not started", "scheduled") else ""
-            pills = f"<span class='pill'>📅 Fixture{st_txt}</span><span class='pill lock'>No prediction for this league yet</span>"
+            pills = f"<span class='pill'>📅 Fixture{st_txt}</span><span class='pill lock'>Not enough recent results for a prediction yet</span>"
         elif has_access:
             pr = m["pr"]
             (i, j), _ = pr["top"][0]
@@ -996,7 +1153,7 @@ def all_tab(has_access, key):
             pills = "<span class='pill lock'>🔒 Prediction locked</span>"
         st.markdown(f"<div class='pick'>{head}{pills}</div>", unsafe_allow_html=True)
         if has_access and m.get("pr"):
-            pid = f"{m['home']}|{m['away']}"
+            pid = f"{m['home']}|{m['away']}" + (f"|{m['pool'][0]}|{m['pool'][1]}" if m.get("pool") else "")
             opened = st.session_state.get("open_all") == pid
             if st.button("✖ Close analysis" if opened else "📈 See analysis",
                          key=f"all_{pid}", use_container_width=True):
@@ -1004,11 +1161,23 @@ def all_tab(has_access, key):
                 st.rerun()
             if opened:
                 with st.spinner("Loading analysis..."):
-                    data, aerr = compute(m["home"], m["away"])
+                    if m.get("pool"):
+                        data, aerr = world_compute(m["pool"], m["home"], m["away"])
+                    else:
+                        data, aerr = compute(m["home"], m["away"])
                 if aerr:
                     st.error(aerr)
                 else:
                     show_result(data)
+    if st.session_state.get("admin_ok"):
+        h = _hl_state()
+        pr_n = sum(1 for m in ms if m.get("pool") and m.get("pr"))
+        st.caption(f"Owner info: history {len(h['days'])}/{HL_HIST_DAYS} days, "
+                   f"{sum(len(v) for v in h['days'].values())} finished matches, "
+                   f"{len(_pools())} leagues; predicted {pr_n} of "
+                   f"{sum(1 for m in ms if m.get('pool'))} extra fixtures shown; "
+                   f"requests today {h['used']}/{hl_budget()}"
+                   f"{'; last error: ' + h['err'] if h['err'] else ''}")
     if res["skipped"]:
         st.caption(f"{res['skipped']} fixture(s) left out because there is not enough "
                    "recent data for one of the teams.")
